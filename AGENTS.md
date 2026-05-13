@@ -17,7 +17,7 @@
 |------|------|
 | `Runtime/Core/` | 主入口 `MobileBridge.cs`、`FrameCapturer.cs`、`TouchReceiver.cs`、`CoordinateMapper.cs` |
 | `Runtime/Capture/` | `URPCaptureFeature.cs`（ScriptableRendererFeature，挂在 URP Renderer Asset 上） |
-| `Runtime/Network/` | `WebSocketServer.cs`、`CertificateHelper.cs`（无第三方依赖，基于 `System.Net.WebSockets`） |
+| `Runtime/Network/` | `WebSocketServer.cs`（基于 `websocket-sharp`） |
 | `Editor/` | `MobileBridgeWindow.cs`、`SetupWizard.cs`、`QRCodeGenerator.cs`（Editor Only asmdef） |
 | `WebClient/` | `client.html`（手机端单文件网页，随包分发，运行时 serve） |
 | `Sandbox~/` | 本地开发测试用 Unity 工程，**不是包的一部分**，`~/` 后缀使 Unity 不导入此目录 |
@@ -27,13 +27,13 @@
 ## 网络端口（两个，不要只开一个）
 
 - **8765**：WebSocket 主连接（画面帧 Binary 下行 + 触控 JSON 上行）
-- **8766**：HTTP/HTTPS 静态文件服务（serve `client.html`，手机扫码后访问）
+- **8766**：HTTP 静态文件服务（serve `client.html`，手机扫码后访问）
 
-## iOS vs Android 差异（核心坑）
+## iOS vs Android 差异
 
 - **Android Chrome**：直接 `ws://`，零配置
-- **iOS Safari**：必须 `wss://`，需先安装自签证书（`CertificateHelper` 自动生成，Setup Wizard 引导用户在 iOS 上安装，仅需一次，有效期 365 天）
-- `client.html` 根据 `location.protocol` 自动选择 `ws:` 或 `wss:`，无需用户手动切换
+- **iOS Safari**：直接 `ws://`，零配置
+- `client.html` 固定使用 `ws:`
 
 ## 坐标换算（两次，顺序固定）
 
@@ -78,28 +78,23 @@ bool isGameView   = renderingData.cameraData.cameraType == CameraType.Game;
 - 新增第三方 DLL 时，必须判断其使用场景：
   - 仅 Editor 使用 → 放 `Editor/Plugins/`，不得放 `Runtime/Plugins/`
   - 运行时必需 → 放 `Runtime/Plugins/`，并在 PR/commit 中明确说明理由和体积影响
-- **禁止**将证书生成、QR 码生成、UI 渲染、Setup Wizard 等 Editor-only 功能的依赖库混入 `Runtime/`。
+- **禁止**将 QR 码生成、UI 渲染、Setup Wizard 等 Editor-only 功能的依赖库混入 `Runtime/`。
 
 ### asmdef 边界
 
 | asmdef | 允许的内容 | 禁止的内容 |
 |--------|-----------|-----------|
-| `MobileBridge.Runtime` | 运行时必需逻辑（WebSocket 收发、帧捕获、触控注入、证书**加载**） | 证书**生成**、Editor GUI、任何 `UnityEditor.*` 引用 |
-| `MobileBridge.Editor` | 所有 Editor 窗口、向导、工具类、证书**生成** | 任何会被打包进玩家构建的逻辑 |
+| `MobileBridge.Runtime` | 运行时必需逻辑（WebSocket 收发、帧捕获、触控注入） | Editor GUI、任何 `UnityEditor.*` 引用 |
+| `MobileBridge.Editor` | 所有 Editor 窗口、向导、工具类 | 任何会被打包进玩家构建的逻辑 |
 
-### 拆分原则（以 CertificateHelper 为范例）
+### 拆分原则
 
-当一个类同时包含"Editor 操作"和"运行时操作"时，必须拆分：
-
-```
-Runtime/Network/CertificateHelper.cs   ← 只保留 Load / Check（CertExists, NeedsRenewal, LoadOrCreate）
-Editor/CertificateGenerator.cs         ← 只保留 Generate()，可依赖 Editor-only 第三方库
-```
+当一个类同时包含"Editor 操作"和"运行时操作"时，必须拆分，避免运行时程序集引入 Editor 依赖。
 
 ### 用户项目不可感知
 
 - 插件不得在用户项目的 Player Settings、Build Settings、场景中自动写入任何持久化配置。
-- 不得在用户的 `Assets/` 目录下创建任何文件；运行时生成的文件（证书、临时文件）只允许写入 `Application.persistentDataPath`（沙盒路径，不影响项目）。
+- 不得在用户的 `Assets/` 目录下创建任何文件；运行时生成的临时文件只允许写入 `Application.persistentDataPath`（沙盒路径，不影响项目）。
 - 不得修改用户项目的 URP Renderer Asset 或其他 ScriptableObject，除非用户通过 Setup Wizard **明确确认**。
 
 ## 设计文档

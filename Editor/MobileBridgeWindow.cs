@@ -82,8 +82,6 @@ namespace MobileBridge.Editor
             GUILayout.Space(8);
             DrawConnection();
             GUILayout.Space(8);
-            DrawCertificate();
-            GUILayout.Space(8);
             DrawControls();
         }
 
@@ -149,68 +147,6 @@ namespace MobileBridge.Editor
             }
         }
 
-        private void DrawCertificate()
-        {
-            EditorGUILayout.LabelField("iOS Certificate", EditorStyles.boldLabel);
-            using var indent = new EditorGUI.IndentLevelScope(1);
-
-            // Status
-            string statusText;
-            MessageType msgType;
-            if (!CertificateHelper.CertExists())
-            {
-                statusText = "Not generated yet.";
-                msgType    = MessageType.Warning;
-            }
-            else if (CertificateHelper.NeedsRenewal())
-            {
-                statusText = "Certificate expires soon or is invalid. Please regenerate.";
-                msgType    = MessageType.Warning;
-            }
-            else
-            {
-                try
-                {
-                    // Read just the cert PEM — no private key needed for expiry display.
-                    byte[] der = CertificateHelper.DecodePem(
-                        System.IO.File.ReadAllText(CertificateHelper.CertPath));
-                    using var c = new System.Security.Cryptography.X509Certificates.X509Certificate2(der);
-                    statusText = $"Valid until {c.NotAfter:yyyy-MM-dd}";
-                }
-                catch
-                {
-                    statusText = "Loaded (expiry unreadable)";
-                }
-                msgType = MessageType.Info;
-            }
-            EditorGUILayout.HelpBox(statusText, msgType);
-
-            // Install URL
-            string ip      = GetLocalIP();
-            string certUrl = $"https://{ip}:{WebSocketServer.HttpPort}/cert";
-
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                EditorGUILayout.SelectableLabel(certUrl, EditorStyles.textField,
-                    GUILayout.Height(EditorGUIUtility.singleLineHeight));
-                if (GUILayout.Button("Copy", GUILayout.Width(50)))
-                    GUIUtility.systemCopyBuffer = certUrl;
-            }
-
-            EditorGUILayout.HelpBox(
-                "Open the URL above in Safari on your iOS device, then install the profile " +
-                "and trust it in: Settings > General > VPN & Device Management.",
-                MessageType.None);
-
-            // Generate / Regenerate button
-            string btnLabel = CertificateHelper.CertExists() ? "Regenerate Certificate" : "Generate Certificate";
-            if (GUILayout.Button(btnLabel))
-            {
-                CertificateGenerator.Generate();
-                Debug.Log("[MobileBridge] Certificate (re)generated.");
-            }
-        }
-
         private void DrawControls()
         {
             bool inPlayMode = EditorApplication.isPlaying;
@@ -242,13 +178,6 @@ namespace MobileBridge.Editor
 
         private void StartBridge()
         {
-            // Ensure certificate exists before starting; auto-generate if missing
-            if (CertificateHelper.NeedsRenewal())
-            {
-                Debug.Log("[MobileBridge] Certificate missing or expiring — auto-generating.");
-                CertificateGenerator.Generate();
-            }
-
             EnsureBridgeComponent();
             if (_bridge == null) return;
             _bridge.targetFps    = _targetFps;
@@ -317,7 +246,7 @@ namespace MobileBridge.Editor
 
         private static string BuildBridgeUrl()
         {
-            return $"https://{GetLocalIP()}:{WebSocketServer.HttpPort}";
+            return $"http://{GetLocalIP()}:{WebSocketServer.HttpPort}";
         }
 
         private void RefreshConnectionVisuals()

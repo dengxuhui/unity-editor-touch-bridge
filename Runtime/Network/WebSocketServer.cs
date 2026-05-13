@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using UnityEngine;
 using WebSocketSharp;
@@ -10,10 +9,9 @@ using WebSocketSharp.Server;
 namespace MobileBridge
 {
     /// <summary>
-    /// Runs two TLS-enabled servers:
-    ///   port 8765 — WebSocket (WSS): binary frame push down, JSON touch up
-    ///   port 8766 — HTTPS static file server: serves client.html on GET /
-    ///                                          serves cert as DER on GET /cert
+    /// Runs two local-network servers:
+    ///   port 8765 — WebSocket (WS): binary frame push down, JSON touch up
+    ///   port 8766 — HTTP static file server: serves client.html on GET /
     /// </summary>
     public sealed class WebSocketServer : IDisposable
     {
@@ -37,26 +35,18 @@ namespace MobileBridge
 
         public void Start()
         {
-            var cert = CertificateHelper.Load();
-            if (cert == null)
-                throw new InvalidOperationException(
-                    "[MobileBridge] No TLS certificate found. " +
-                    "Please generate one first via Window > Mobile Bridge > Generate Certificate.");
-
-            // ── WebSocket server (port 8765, WSS) ─────────────────────────────
-            _wsServer = new WebSocketSharp.Server.WebSocketServer(WsPort, secure: true);
-            ConfigureSsl(_wsServer.SslConfiguration, cert);
+            // ── WebSocket server (port 8765, WS) ──────────────────────────────
+            _wsServer = new WebSocketSharp.Server.WebSocketServer(WsPort, secure: false);
             _wsServer.AddWebSocketService<BridgeBehavior>("/", b => b.Init(FireTouchMessage));
             _wsServer.Start();
 
-            // ── HTTP server (port 8766, HTTPS) ────────────────────────────────
-            _httpServer = new HttpServer(HttpPort, secure: true);
-            ConfigureSsl(_httpServer.SslConfiguration, cert);
+            // ── HTTP server (port 8766, HTTP) ─────────────────────────────────
+            _httpServer = new HttpServer(HttpPort, secure: false);
             _httpServer.OnGet += HandleHttpGet;
             _httpServer.Start();
 
-            Debug.Log($"[MobileBridge] WSS  listening on :{WsPort}");
-            Debug.Log($"[MobileBridge] HTTPS listening on :{HttpPort}");
+            Debug.Log($"[MobileBridge] WS   listening on :{WsPort}");
+            Debug.Log($"[MobileBridge] HTTP listening on :{HttpPort}");
         }
 
         public void Stop()
@@ -79,17 +69,6 @@ namespace MobileBridge
             Stop();
         }
 
-        // ── SSL configuration helper ───────────────────────────────────────────
-
-        private static void ConfigureSsl(WebSocketSharp.Net.ServerSslConfiguration ssl, X509Certificate2 cert)
-        {
-            ssl.ServerCertificate = cert;
-            ssl.EnabledSslProtocols =
-                System.Security.Authentication.SslProtocols.Tls12;
-            // Client does not send a certificate; accept all (iOS user-installed cert)
-            ssl.ClientCertificateValidationCallback = (_, __, ___, ____) => true;
-        }
-
         // ── HTTP request handler ───────────────────────────────────────────────
 
         private void HandleHttpGet(object sender, HttpRequestEventArgs e)
@@ -103,10 +82,6 @@ namespace MobileBridge
                 if (path == "/" || path == "/index.html")
                 {
                     ServeClientHtml(res);
-                }
-                else if (path == "/cert")
-                {
-                    ServeCert(res);
                 }
                 else
                 {
@@ -134,24 +109,6 @@ namespace MobileBridge
                 res.StatusCode = 503;
                 var msg = System.Text.Encoding.UTF8.GetBytes("client.html not found");
                 res.OutputStream.Write(msg, 0, msg.Length);
-            }
-        }
-
-        private static void ServeCert(HttpListenerResponse res)
-        {
-            try
-            {
-                var cert    = CertificateHelper.Load();
-                var derBytes = cert.Export(X509ContentType.Cert); // DER, public key only
-                res.ContentType = "application/x-x509-ca-cert";
-                res.Headers.Add("Content-Disposition", "attachment; filename=\"mobileBridge.cer\"");
-                res.ContentLength64 = derBytes.Length;
-                res.OutputStream.Write(derBytes, 0, derBytes.Length);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[MobileBridge] /cert error: {ex.Message}");
-                res.StatusCode = 500;
             }
         }
 

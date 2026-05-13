@@ -8,7 +8,7 @@
 - **基于 WebSocket**，局域网零配置，无需信令服务器
 - **触控事件直接注入 Unity Input System**，系统鼠标完全不动
 - **支持 Mac / Windows** 双平台开发机
-- **支持 iOS Safari（WSS）和 Android Chrome（WS）**
+- **支持 iOS Safari / Android Chrome（统一 WS）**
 
 ## 系统要求
 
@@ -38,9 +38,8 @@ https://github.com/dengxuhui/unity-editor-touch-bridge.git
 
 1. 安装插件后，打开菜单 **Window → Mobile Bridge → Setup Wizard**
 2. Wizard 会自动检测 URP Renderer Asset 并添加 `URPCaptureFeature`
-3. iOS 用户按引导安装自签证书（仅需一次）
-4. 点击 Play，打开 Mobile Bridge 面板，点击 **启动**
-5. 手机扫描二维码或访问显示的链接，即可看到游戏画面并进行触控操作
+3. 点击 Play，打开 Mobile Bridge 面板，点击 **启动**
+4. 手机扫描二维码或访问显示的链接，即可看到游戏画面并进行触控操作
 
 ## 项目结构
 
@@ -50,7 +49,7 @@ unity-editor-touch-bridge/
 ├── Runtime/                            # 运行时代码
 │   ├── Core/                           # 核心逻辑（MobileBridge, FrameCapturer 等）
 │   ├── Capture/                        # URP ScriptableRendererFeature
-│   ├── Network/                        # WebSocket 服务器 & 证书工具
+│   ├── Network/                        # WebSocket / HTTP 服务器
 │   └── MobileBridge.Runtime.asmdef
 ├── Editor/                             # 编辑器面板、Setup Wizard、二维码生成
 │   └── MobileBridge.Editor.asmdef

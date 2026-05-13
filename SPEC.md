@@ -17,7 +17,7 @@
 
 **支持平台：**
 - 开发机：macOS、Windows
-- 手机端：iOS Safari（需 WSS）、Android Chrome（ws 直连）
+- 手机端：iOS Safari、Android Chrome（统一 `ws://`）
 
 ---
 
@@ -47,7 +47,7 @@
 │  │  └────────┬────────┘  └──────────┬───────────┘  │ │
 │  └───────────│──────────────────────│───────────────┘ │
 └──────────────│──────────────────────│─────────────────┘
-               │  画面帧 (JPEG/WSS)   │ 触控坐标 (JSON)
+               │  画面帧 (JPEG/WS)    │ 触控坐标 (JSON)
                │         局域网 WiFi  │
                ▼                      │
 ┌──────────────────────────────────┐  │
@@ -67,8 +67,6 @@
 | `TouchReceiver.cs` | C# | WebSocket 服务端接收触控坐标，注入 Unity Input System |
 | `CoordinateMapper.cs` | C# | 三坐标系换算，处理 Y 轴翻转和黑边偏移 |
 | `MobileBridgeWindow.cs` | C# (Editor) | Editor 控制面板，显示连接状态、二维码、配置参数 |
-| `CertificateGenerator.cs` | C# (Editor only) | 用 BouncyCastle 生成自签 SSL 证书并写 cert.pem + key-params.xml |
-| `CertificateHelper.cs` | C# (Runtime) | 加载 cert.pem + key-params.xml，组装带私钥的 X509Certificate2 |
 | `client.html` | HTML/JS | 手机端单文件网页，Canvas 渲染 + Touch 采集 |
 
 ---
@@ -90,8 +88,7 @@ unity-mobile-bridge/                    ← Git 仓库根目录
 │   ├── Capture/
 │   │   └── URPCaptureFeature.cs        ← ScriptableRendererFeature 实现
 │   ├── Network/
-│   │   ├── WebSocketServer.cs          ← 基于 websocket-sharp
-│   │   └── CertificateHelper.cs        ← 加载证书（cert.pem + key-params.xml）
+│   │   └── WebSocketServer.cs          ← 基于 websocket-sharp
 │   ├── Plugins/
 │   │   └── websocket-sharp.dll         ← Runtime 依赖
 │   └── MobileBridge.Runtime.asmdef
@@ -100,9 +97,6 @@ unity-mobile-bridge/                    ← Git 仓库根目录
 │   ├── MobileBridgeWindow.cs           ← Editor 控制面板
 │   ├── SetupWizard.cs                  ← 首次配置向导
 │   ├── QRCodeGenerator.cs              ← 二维码生成
-│   ├── CertificateGenerator.cs         ← BouncyCastle 证书生成（Editor only）
-│   ├── Plugins/
-│   │   └── BouncyCastle.Cryptography.dll ← Editor only，所有玩家平台已排除
 │   └── MobileBridge.Editor.asmdef      ← Editor Only
 │
 ├── WebClient/
@@ -342,67 +336,31 @@ Setup Wizard 首次配置时自动检测并记录偏移量，或引导用户将 
 Unity 侧同时运行两个服务：
 
 ```
-端口 8765 (WSS / WS) — WebSocket 主连接
+端口 8765 (WS) — WebSocket 主连接
   ├── 服务端 → 客户端：推送 JPEG 画面帧（Binary）
   └── 客户端 → 服务端：接收触控事件（JSON Text）
 
-端口 8766 (HTTPS / HTTP) — 静态文件服务
+端口 8766 (HTTP) — 静态文件服务
   └── GET / → 返回 client.html（手机扫码后直接获取页面）
 ```
 
-基于 `System.Net.WebSockets` 实现，无第三方依赖。
+基于 `websocket-sharp` 实现。
 
 ---
 
-## 五、iOS 兼容方案（WSS）
+## 五、iOS 与 Android 连接策略（统一 WS）
 
-iOS Safari 对 `ws://`（明文）存在限制，需使用 `wss://`（加密连接）。
+iOS Safari 与 Android Chrome 均使用明文局域网链路：
 
-**自签证书流程（Setup Wizard 自动完成）：**
+- 页面访问：`http://[IP]:8766`
+- WebSocket 连接：`ws://[IP]:8765`
 
-```
-1. 首次启动，Editor 侧 CertificateGenerator（BouncyCastle）自动生成本机自签 SSL 证书
-2. Editor 面板显示引导：
-   「请用手机浏览器访问 https://[IP]:8766/cert，
-     按提示安装描述文件（仅需操作一次）」
-3. 安装后，wss:// 连接正常工作
-4. 证书有效期 365 天，过期后 Setup Wizard 自动重新生成
-```
+不再包含证书生成、下载、安装与信任流程。
 
-**证书存储格式：**
-
-证书以两个文件形式存储在 `Application.persistentDataPath/MobileBridge/`：
-
-| 文件 | 内容 | 格式 |
-|------|------|------|
-| `cert.pem` | X.509 公钥证书 | DER base64 PEM |
-| `key-params.xml` | RSA 私钥参数 | RSACryptoServiceProvider XML |
-
-**为什么不用 PFX / PKCS#12？**
-
-Unity 2022.3 的 Mono 运行时无法可靠解析 BouncyCastle 生成的 PKCS#12 文件（BouncyCastle 默认使用 RC2-40-CBC 加密证书袋，Mono 不支持）。同理，`ImportPkcs8PrivateKey` 等现代 API 在 Mono 上均为未实现的 stub，会抛 `PlatformNotSupportedException`。
-
-**为什么私钥用 XML 格式？**
-
-`RSACryptoServiceProvider.FromXmlString()` 是 Mono 上少数**真正实现**的私钥导入 API，可直接接受包含全部 RSA 参数的 XML 字符串，无需依赖任何外部库。
-
-**职责分离（零侵入原则）：**
-
-| 模块 | 位置 | 职责 |
-|------|------|------|
-| `CertificateGenerator` | `Editor/`（Editor only） | 用 BouncyCastle 生成密钥对和证书，写 cert.pem + key-params.xml |
-| `CertificateHelper` | `Runtime/Network/`（Runtime） | 读 cert.pem（PEM 解码）+ key-params.xml（FromXmlString），组装带私钥的 `X509Certificate2` |
-
-BouncyCastle DLL（`Editor/Plugins/BouncyCastle.Cryptography.dll`）仅在 Editor 中使用，所有玩家平台均已排除，不进入用户构建包。
-
-**Android Chrome：** 直接使用 `ws://`，无需证书，零配置。
-
-**自动协议选择（client.html）：**
+**客户端连接逻辑（client.html）：**
 
 ```javascript
-// 根据访问协议自动选择 ws 或 wss，无需用户手动配置
-const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-const ws = new WebSocket(`${protocol}//${location.hostname}:8765`)
+const ws = new WebSocket(`ws://${location.hostname}:8765`)
 ```
 
 ---
@@ -427,8 +385,6 @@ const ws = new WebSocket(`${protocol}//${location.hostname}:8765`)
 │  │  ██████          │  [ 复制链接 ]          │
 │  └──────────────────┘                        │
 ├──────────────────────────────────────────────┤
-│  iOS 证书   [ 已安装 ✓ ]   [ 重新生成 ]      │
-│                                              │
 │  [ ▶ 启动 ]  [ ⏹ 停止 ]  [ ⚙ Setup Wizard ]│
 └──────────────────────────────────────────────┘
 ```
@@ -520,8 +476,6 @@ GPU 渲染完成
 
 2. 菜单 Window → Mobile Bridge → Setup Wizard
    ① 自动检测 URP Renderer Asset，添加 URPCaptureFeature
-   ② 自动生成自签 SSL 证书
-   ③ 引导用户在 iOS 手机上安装证书（Android 跳过此步）
 
 3. 配置完成，后续直接使用 Editor 面板
 ```
@@ -544,7 +498,6 @@ GPU 渲染完成
 | 画面捕获（AsyncGPUReadback） | ✅ | ✅ |
 | WebSocket 服务 | ✅ | ✅ |
 | Unity Input System 注入 | ✅ | ✅ |
-| 自签证书生成 | ✅ | ✅ |
 | DPI 处理 | Retina 固定 2x | 运行时读取系统 DPI 动态换算 |
 
 Windows DPI 换算：
@@ -564,11 +517,10 @@ float dpiScale = Screen.dpi / 96f;
 
 | 风险 | 影响 | 缓解方案 |
 |------|------|---------|
-| iOS 需安装自签证书 | 首次多一步操作 | Setup Wizard 全程引导，仅需一次 |
 | AsyncGPUReadback 固定 1-2 帧延迟 | 延迟无法消除 | 属于方案固有成本，对触控测试可接受 |
 | Game View 黑边导致坐标偏移 | 点击位置不准 | 自动检测偏移量，或引导用户开启 Stretch 模式 |
 | Windows DPI 各设备不同 | 坐标偏移 | 运行时动态读取系统 DPI，自动换算 |
-| iOS Safari 不支持 ws:// | 连接失败 | 强制走 wss://，自签证书方案解决 |
+| 企业/公共网络限制明文 WS | 连接失败或握手被拦截 | 建议使用同一私有 Wi-Fi，避免隔离网络/访客网络 |
 | 仅支持 URP 渲染管线 | Built-in / HDRP 项目无法使用 | SPEC 明确声明范围，文档说明 |
 
 ---

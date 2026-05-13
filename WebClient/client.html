@@ -81,7 +81,7 @@
             clearTimeout(reconnectTimer);
             everConnected = false;
 
-            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const protocol = 'ws:';
             status.textContent = 'Connecting…';
             ws = new WebSocket(`${protocol}//${host}:8765`);
             ws.binaryType = 'arraybuffer';
@@ -99,16 +99,7 @@
             };
 
             ws.onerror = () => {
-                if (!everConnected && location.protocol === 'https:') {
-                    const certUrl = `${location.protocol}//${location.hostname}:${location.port ? location.port.replace('8766','8766') : '8766'}/cert`;
-                    const httpPort = 8766;
-                    status.innerHTML =
-                        'Connection failed. You may need to install the certificate first.<br>' +
-                        `Open in Safari: <a href="https://${location.hostname}:${httpPort}/cert" ` +
-                        `style="color:#6af">https://${location.hostname}:${httpPort}/cert</a>`;
-                } else {
-                    status.textContent = 'Connection error';
-                }
+                status.textContent = 'Connection error';
             };
 
             ws.onmessage = async (e) => {

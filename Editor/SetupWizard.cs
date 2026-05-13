@@ -15,7 +15,7 @@ namespace MobileBridge.Editor
             win.minSize = new Vector2(480, 360);
         }
 
-        private enum Step { CheckURP, AddFeature, Certificate, Done }
+        private enum Step { CheckURP, AddFeature, Done }
 
         private Step   _step = Step.CheckURP;
         private string _log  = "";
@@ -34,7 +34,6 @@ namespace MobileBridge.Editor
             {
                 case Step.CheckURP:    DrawCheckUrp();    break;
                 case Step.AddFeature:  DrawAddFeature();  break;
-                case Step.Certificate: DrawCertificate(); break;
                 case Step.Done:        DrawDone();        break;
             }
 
@@ -92,32 +91,7 @@ namespace MobileBridge.Editor
 
             GUILayout.Space(4);
             if (GUILayout.Button("Skip (already added)"))
-                _step = Step.Certificate;
-        }
-
-        private void DrawCertificate()
-        {
-            EditorGUILayout.LabelField("Step 3 — iOS Certificate (optional)", EditorStyles.boldLabel);
-            EditorGUILayout.HelpBox(
-                "Android Chrome works over plain ws:// — no certificate needed.\n\n" +
-                "For iOS Safari, a self-signed TLS certificate is required for wss://.\n" +
-                "Generate the certificate below, then install it on your iPhone:\n" +
-                "  1. In Safari, open  https://<YourIP>:8766/cert\n" +
-                "  2. Follow the prompts to install the profile.\n" +
-                "  3. Trust it in Settings > General > VPN & Device Management.",
-                MessageType.Info);
-
-            bool exists = CertificateHelper.CertExists();
-            EditorGUILayout.LabelField("Certificate status:", exists ? "Exists" : "Not generated");
-
-            if (GUILayout.Button(exists ? "Regenerate Certificate" : "Generate Certificate"))
-            {
-                CertificateGenerator.Generate();
-                _log = $"Certificate saved to:\n{CertificateHelper.CertPath}";
-            }
-
-            GUILayout.Space(4);
-            if (GUILayout.Button("Next →")) _step = Step.Done;
+                _step = Step.Done;
         }
 
         private void DrawDone()
@@ -160,7 +134,7 @@ namespace MobileBridge.Editor
                 if (f is URPCaptureFeature)
                 {
                     _log = "URPCaptureFeature is already in the renderer.";
-                    _step = Step.Certificate;
+                    _step = Step.Done;
                     return;
                 }
             }
@@ -175,7 +149,7 @@ namespace MobileBridge.Editor
             AssetDatabase.SaveAssets();
 
             _log = "URPCaptureFeature added successfully.";
-            _step = Step.Certificate;
+            _step = Step.Done;
         }
     }
 }

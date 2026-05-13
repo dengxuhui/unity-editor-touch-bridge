@@ -9,7 +9,7 @@ namespace MobileBridge.Editor
     /// Minimal self-contained QR code generator for editor UI.
     ///
     /// Current implementation targets a fixed QR version (V3-L), which is
-    /// sufficient for the bridge URL use case (e.g. https://192.168.1.10:8766).
+    /// sufficient for the bridge URL use case (e.g. http://192.168.1.10:8766).
     /// No third-party dependency is required.
     /// </summary>
     public static class QRCodeGenerator
@@ -27,7 +27,7 @@ namespace MobileBridge.Editor
         public static Texture2D Generate(string text, int pixelSize = 128)
         {
             if (string.IsNullOrEmpty(text))
-                text = "https://127.0.0.1:8766";
+                text = "http://127.0.0.1:8766";
 
             if (_cachedTexture != null && _cachedText == text && _cachedSize == pixelSize)
                 return _cachedTexture;
