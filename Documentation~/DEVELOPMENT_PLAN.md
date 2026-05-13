@@ -32,7 +32,7 @@
 - 核对目录职责：`Runtime/Core`、`Runtime/Capture`、`Runtime/Network`、`Editor`、`WebClient`。
 - 核对网络端口：WebSocket `8765`、HTTP `8766`。
 - 核对 URP 注入条件：`Base Camera && Game View && MobileBridge.IsActive`。
-- 核对帧捕获三段式：`AsyncGPUReadback -> 主线程拷贝入队 -> 后台线程 JPEG+发送`。
+- 核对帧捕获方案：`WaitForEndOfFrame + ReadPixels`（含 Canvas Overlay）→ 主线程 JPEG 编码 → 后台线程发送（原 AsyncGPUReadback 三段式已废弃，因无法捕获 Canvas Overlay）。
 - 核对触控协议字段与事件枚举：`began/moved/ended/cancelled`。
 
 **验收标准**
@@ -113,7 +113,7 @@
 |------|------|----------|----------|------|
 | P0 基线对齐 | DONE | 2026-05-13 | 2026-05-13 | 全量源码实现，通过五项核对 |
 | P1 基础链路打通 | DONE | 2026-05-13 | 2026-05-13 | Android ws:// 验收通过 |
-| P2 平台稳定性 | IN_PROGRESS | 2026-05-13 | - | iOS ws:// 链路验证进行中；URPCaptureFeature handle 访问时序已修复 |
+| P2 平台稳定性 | IN_PROGRESS | 2026-05-13 | - | iOS ws:// 链路验证进行中；URPCaptureFeature handle 访问时序已修复；Canvas Overlay 支持已完成（改为 WaitForEndOfFrame + ReadPixels） |
 | P3 性能与体验 | TODO | - | - | - |
 | P4 发布准备 | TODO | - | - | - |
 
@@ -127,3 +127,4 @@
 | 2026-05-13 | P2 | 证书生成 Mono 兼容性修复（三轮） | **根本问题**：Unity 2022.3 Mono 大量 `System.Security.Cryptography` API 为未实现 stub。**第一轮**：`CertificateRequest` 抛 `PlatformNotSupportedException` → 引入 BouncyCastle 2.4.0（`Editor/Plugins/`，Editor only）；**第二轮**：BouncyCastle 生成的 PKCS#12 中 RC2-40-CBC 证书袋 Mono 无法解析 → 改为 cert.pem（DER）+ key.pem（PKCS#8）存储；**第三轮**：`ImportPkcs8PrivateKey` 也是 stub → 改为 cert.pem + key-params.xml（RSA XML）存储，生成端用 `DotNetUtilities.ToRSA()` + `ToXmlString(true)`，加载端用 `RSACryptoServiceProvider.FromXmlString()`。职责拆分：`CertificateGenerator`（Editor only，依赖 BouncyCastle）负责生成；`CertificateHelper`（Runtime，无外部依赖）负责加载。 |
 | 2026-05-13 | P2 | URPCaptureFeature handle 访问时序修复 | `AddRenderPasses` 中访问 `renderer.cameraColorTargetHandle` 抛错（URP 2022.3 明确禁止）。修复：`AddRenderPasses` 只做 `EnqueuePass`；`SetupRenderPasses` 中调用 `_pass.Setup(renderer.cameraColorTargetHandle)`，此时 handle 已合法。同步修复 `in RenderingData` 参数不能用 `ref var` 取引用（CS8330）。 |
 | 2026-05-13 | P2 | 协议策略调整为 HTTP + WS | 按最新 SPEC 移除证书相关功能：删除 `CertificateGenerator` / `CertificateHelper` 与 BouncyCastle 依赖；`WebSocketServer` 改为 `WS:8765 + HTTP:8766`；`client.html` 固定 `ws://`；Editor 面板与 Setup Wizard 移除证书入口。 |
+| 2026-05-13 | P2 | Canvas Overlay 支持：捕获方案从 AsyncGPUReadback 改为 WaitForEndOfFrame + ReadPixels | **根本问题**：`ScriptableRenderPass.Execute()` 在 URP 管线内触发，此时 Screen Space Overlay Canvas 尚未合成到 backbuffer，导致浏览器画面中看不到 2D UI。**解决方案**：将帧捕获逻辑从 `URPCaptureFeature` 迁移至 `MobileBridge.CaptureLoop()` 协程，在 `WaitForEndOfFrame` 之后执行 `ReadPixels`，此时所有内容（3D 场景 + Overlay 相机 + Canvas UI）已完整合成。`URPCaptureFeature` 简化为空壳保留兼容性。代价：主线程额外约 3-8ms 同步开销（ReadPixels + EncodeToJPG），对 Editor 工具可接受。SPEC.md 已同步更新。 |

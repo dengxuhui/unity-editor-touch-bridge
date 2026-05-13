@@ -31,19 +31,19 @@
 │                                                       │
 │  ┌─────────────────────────────────────────────────┐ │
 │  │              Unity Game View                    │ │
-│  │  Base Camera                                    │ │
-│  │    └── Overlay Camera(s)  ← URP Camera Stack   │ │
+│  │  Base Camera + Overlay Camera(s) + Canvas UI   │ │
+│  │    （所有内容在 WaitForEndOfFrame 后完整合成）   │ │
 │  └──────────────────┬──────────────────────────────┘ │
-│                     │ ScriptableRendererFeature       │
-│                     │ AfterRendering 捕获             │
+│                     │ WaitForEndOfFrame              │
+│                     │ ReadPixels（含 Canvas Overlay）│
 │  ┌──────────────────▼──────────────────────────────┐ │
 │  │              MobileBridge Runtime                │ │
 │  │  ┌─────────────────┐  ┌──────────────────────┐  │ │
 │  │  │  FrameCapturer   │  │   TouchReceiver      │  │ │
 │  │  │                 │  │                      │  │ │
-│  │  │ AsyncGPUReadback│  │ 接收归一化坐标        │  │ │
-│  │  │ 后台线程JPEG编码 │  │ 换算 Unity 坐标      │  │ │
-│  │  │ WebSocket 推帧   │  │ 注入 Input System    │  │ │
+│  │  │ CaptureLoop 协程│  │ 接收归一化坐标        │  │ │
+│  │  │ ReadPixels 读帧  │  │ 换算 Unity 坐标      │  │ │
+│  │  │ 后台线程推 JPEG  │  │ 注入 Input System    │  │ │
 │  │  └────────┬────────┘  └──────────┬───────────┘  │ │
 │  └───────────│──────────────────────│───────────────┘ │
 └──────────────│──────────────────────│─────────────────┘
@@ -62,8 +62,8 @@
 
 | 模块 | 语言 | 职责 |
 |------|------|------|
-| `URPCaptureFeature.cs` | C# | 挂载在 URP Renderer Asset，捕获最终合成帧 |
-| `FrameCapturer.cs` | C# | AsyncGPUReadback + 后台线程 JPEG 编码 + WebSocket 推流 |
+| `URPCaptureFeature.cs` | C# | 挂载在 URP Renderer Asset，保留空壳以兼容已配置项目（捕获已迁移至 MobileBridge） |
+| `FrameCapturer.cs` | C# | 后台线程 JPEG 编码 + WebSocket 推流 |
 | `TouchReceiver.cs` | C# | WebSocket 服务端接收触控坐标，注入 Unity Input System |
 | `CoordinateMapper.cs` | C# | 三坐标系换算，处理 Y 轴翻转和黑边偏移 |
 | `MobileBridgeWindow.cs` | C# (Editor) | Editor 控制面板，显示连接状态、二维码、配置参数 |
@@ -129,51 +129,47 @@ unity-mobile-bridge/                    ← Git 仓库根目录
 
 ## 四、核心模块详细设计
 
-### 4.1 画面捕获：URPCaptureFeature
+### 4.1 画面捕获：MobileBridge.CaptureLoop
 
-**原理：** URP 使用 Camera Stacking，所有 Overlay Camera 的结果最终合成在 Base Camera 的 RenderTarget 中。在 Base Camera 的 `AfterRendering` 阶段捕获即可拿到完整合成画面（含所有 UI 层、特效层）。
+**原理：** Unity 的 `WaitForEndOfFrame` 是唯一能看到完整合成帧（含 Screen Space Overlay Canvas）的时机。`ScriptableRenderPass.Execute()` 在 URP 渲染管线内执行，此时 Canvas Overlay 尚未叠加到屏幕；`WaitForEndOfFrame` 则等待 Unity 将所有内容（3D 场景 + Overlay Camera + Canvas UI）完整合成到 backbuffer 之后，才继续执行。
+
+**为什么不用 URPCaptureFeature + AsyncGPUReadback：**
+
+| 方案 | Canvas Overlay 可见 | 说明 |
+|------|-------------------|------|
+| `ScriptableRenderPass AfterRendering` + AsyncGPUReadback | ❌ | 捕获时机在 Canvas Overlay 合成之前 |
+| `WaitForEndOfFrame` + `ReadPixels` | ✅ | Unity 已将所有内容合成到 backbuffer |
+
+`URPCaptureFeature` 保留为空壳，防止已配置 Renderer Asset 的项目报引用丢失错误，不再注入任何 RenderPass。
+
+**CaptureLoop 伪代码（在 `MobileBridge.cs` 中）：**
 
 ```csharp
-public class URPCaptureFeature : ScriptableRendererFeature
+private IEnumerator CaptureLoop()
 {
-    private CapturePass _pass;
-
-    public override void Create()
+    var waitEof = new WaitForEndOfFrame();
+    while (IsActive)
     {
-        _pass = new CapturePass { renderPassEvent = RenderPassEvent.AfterRendering };
-    }
+        // 按 targetFps 限流
+        if (Time.realtimeSinceStartup - _lastCaptureTime < 1f / targetFps)
+        {
+            yield return null;
+            continue;
+        }
 
-    public override void AddRenderPasses(ScriptableRenderer renderer,
-                                          ref RenderingData renderingData)
-    {
-        // 只在以下条件同时满足时注入：
-        // 1. 是 Base Camera（非 Overlay）
-        // 2. 是 Game View（非 Scene View / Preview 等）
-        // 3. MobileBridge 当前处于激活状态
-        bool isBaseCamera = renderingData.cameraData.renderType == CameraRenderType.Base;
-        bool isGameView   = renderingData.cameraData.cameraType == CameraType.Game;
+        yield return waitEof;   // ← 此处 Canvas Overlay 已完整合成
 
-        if (isBaseCamera && isGameView && MobileBridge.IsActive)
-            renderer.EnqueuePass(_pass);
-        // 注意：不在此处访问 renderer.cameraColorTargetHandle，
-        // 该 handle 在 AddRenderPasses 阶段尚未准备好。
-    }
+        // ReadPixels 从屏幕 backbuffer 读取像素（同步，~1-3ms）
+        _readbackTex.ReadPixels(new Rect(srcX, srcY, readW, readH), 0, 0, false);
+        _readbackTex.Apply(false);
 
-    // SetupRenderPasses 在所有 pass 入队后、渲染开始前调用，
-    // 此时 cameraColorTargetHandle 已合法，可安全传递给 pass。
-    public override void SetupRenderPasses(ScriptableRenderer renderer,
-                                            in RenderingData renderingData)
-    {
-        bool isBaseCamera = renderingData.cameraData.renderType == CameraRenderType.Base;
-        bool isGameView   = renderingData.cameraData.cameraType == CameraType.Game;
-
-        if (isBaseCamera && isGameView && MobileBridge.IsActive)
-            _pass.Setup(renderer.cameraColorTargetHandle);
+        byte[] jpeg = _readbackTex.EncodeToJPG(jpegQuality);
+        _capturer.EnqueueJpeg(jpeg);   // 投入后台线程队列发送
     }
 }
 ```
 
-**用户操作：** 在 URP Renderer Asset 的 Renderer Features 列表中添加 `URPCaptureFeature`（Setup Wizard 自动完成）。
+**用户操作：** `URPCaptureFeature` 仍需挂载在 URP Renderer Asset（Setup Wizard 自动完成），但其存在不影响捕获行为。
 
 ---
 
@@ -182,36 +178,28 @@ public class URPCaptureFeature : ScriptableRendererFeature
 **核心流程：**
 
 ```
-每帧（受 FPS 限制）：
+每帧（受 targetFps 限流）：
 
-① ScriptableRenderPass.Execute()
-     → AsyncGPUReadback.RequestIntoNativeArray(renderTarget, onComplete)
-     （非阻塞，主线程立即返回，1-2 帧后回调）
+① MobileBridge.CaptureLoop（协程，主线程）
+     yield return WaitForEndOfFrame
+     → ReadPixels 读取完整屏幕（含 Canvas Overlay）
+     → EncodeToJPG（主线程，~2-5ms）
+     → EnqueueJpeg() 投入后台队列
 
-② onComplete 回调（主线程）
-     → 将 NativeArray<byte> 数据复制到托管内存
-     → 投递到后台线程队列
-
-③ 后台线程（独立 Thread，常驻）
-     → 编码 JPEG（使用 System.Drawing 或第三方库）
-     → 通过 WebSocket 发送给所有已连接客户端
+② FrameCapturer 后台线程（常驻）
+     → 取出 JPEG bytes
+     → WebSocket BroadcastFrameAsync 发送给所有客户端
 ```
 
-**为什么分三步：**
+**为什么 ReadPixels 在主线程执行是可接受的：**
 
-| 方案 | 问题 |
-|------|------|
-| `ReadPixels`（同步） | 阻塞主线程等待 GPU，帧率骤降至个位数，不可用 |
-| `AsyncGPUReadback` 回调内直接编码 | 回调在主线程，JPEG 编码 10-30ms 仍会卡顿 |
-| `AsyncGPUReadback` + 后台线程编码 | 主线程开销 <0.1ms，完全无感知 ✅ |
+| 操作 | 执行线程 | 耗时 | 说明 |
+|------|---------|------|------|
+| `ReadPixels`（同步读屏） | 主线程 | ~1-3ms | GPU 同步，轻微开销，Editor 工具可接受 |
+| `EncodeToJPG` | 主线程 | ~2-5ms | Unity 内置编码器，无外部依赖 |
+| WebSocket 发送 | 后台线程 | 1-5ms | 不影响主线程 |
 
-**帧率限流：**
-
-```csharp
-// 不是每帧都捕获，按目标 FPS 限流
-if (Time.realtimeSinceStartup - _lastCaptureTime < 1f / targetFPS) return;
-_lastCaptureTime = Time.realtimeSinceStartup;
-```
+> **注意：** 与原三段式方案相比，ReadPixels 会引入轻微主线程 GPU 同步开销（约 1-3ms），但消除了 AsyncGPUReadback 固有的 1-2 帧异步延迟，且能正确捕获 Canvas Overlay。对 Editor 调试工具而言这是合理的权衡。
 
 **推荐串流分辨率：**
 
@@ -441,28 +429,32 @@ canvas.addEventListener('touchcancel', handleTouch('cancelled'), { passive: fals
 
 ## 八、性能指标
 
-### 延迟预算（目标：端到端 < 100ms）
+### 延迟预算（目标：端到端 < 120ms）
 
 ```
 GPU 渲染完成
-  ↓ AsyncGPUReadback 延迟        33-66ms（1-2帧，固定成本）
-  ↓ 后台线程 JPEG 编码            5-15ms
-  ↓ WebSocket 传输（局域网）       1-5ms
-  ↓ 手机浏览器解码渲染             3-8ms
+  ↓ WaitForEndOfFrame 等待                 0-33ms（等待本帧渲染完成）
+  ↓ ReadPixels（同步读屏）                  1-3ms
+  ↓ EncodeToJPG（主线程）                   2-5ms
+  ↓ WebSocket 传输（局域网）                 1-5ms
+  ↓ 手机浏览器解码渲染                       3-8ms
 ────────────────────────────────────────
-总端到端延迟                       约 50-100ms ✅
+总端到端延迟                               约 10-55ms ✅
 ```
+
+> 与 AsyncGPUReadback 方案相比，消除了 1-2 帧（33-66ms）的 GPU 异步等待，但引入约 3-8ms 主线程同步开销。整体延迟更低，且支持 Canvas Overlay。
 
 ### 对游戏主线程的影响
 
 | 操作 | 执行线程 | 耗时 | 影响 |
 |------|---------|------|------|
-| AsyncGPUReadback 发起 | 主线程 | <0.1ms | 几乎为零 |
-| JPEG 编码 | 后台线程 | 5-15ms | 无影响 |
+| WaitForEndOfFrame 等待 | 协程（主线程） | 0ms（等待，不占 CPU） | 无影响 |
+| ReadPixels | 主线程 | 1-3ms | 轻微 GPU 同步开销 |
+| EncodeToJPG | 主线程 | 2-5ms | 轻微，Editor 工具可接受 |
 | WebSocket 发送 | 后台线程 | 1-5ms | 无影响 |
 | 触控事件注入 | 主线程 | <0.1ms | 几乎为零 |
 
-**插件对游戏帧率影响可忽略不计。**
+**插件对游戏帧率影响极小（主线程总计约 3-8ms/帧），对 Editor 调试工具可接受。**
 
 ---
 
@@ -517,7 +509,7 @@ float dpiScale = Screen.dpi / 96f;
 
 | 风险 | 影响 | 缓解方案 |
 |------|------|---------|
-| AsyncGPUReadback 固定 1-2 帧延迟 | 延迟无法消除 | 属于方案固有成本，对触控测试可接受 |
+| ReadPixels 主线程 GPU 同步 | 每帧额外 1-3ms 主线程开销 | Editor 调试工具可接受；如需优化可探索 AsyncGPUReadback + 额外合成步骤 |
 | Game View 黑边导致坐标偏移 | 点击位置不准 | 自动检测偏移量，或引导用户开启 Stretch 模式 |
 | Windows DPI 各设备不同 | 坐标偏移 | 运行时动态读取系统 DPI，自动换算 |
 | 企业/公共网络限制明文 WS | 连接失败或握手被拦截 | 建议使用同一私有 Wi-Fi，避免隔离网络/访客网络 |
