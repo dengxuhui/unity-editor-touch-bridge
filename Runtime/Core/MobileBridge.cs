@@ -1,3 +1,4 @@
+using System.Collections;
 using System.IO;
 using UnityEngine;
 #if UNITY_EDITOR
@@ -37,6 +38,10 @@ namespace MobileBridge
         private FrameCapturer   _capturer;
         private TouchReceiver   _receiver;
 
+        // Reusable texture for ReadPixels — avoid per-frame alloc
+        private Texture2D _readbackTex;
+        private float     _lastCaptureTime;
+
         private static string ClientHtmlPath
         {
             get
@@ -69,6 +74,11 @@ namespace MobileBridge
         {
             StopBridge();
             if (Instance == this) Instance = null;
+            if (_readbackTex != null)
+            {
+                Destroy(_readbackTex);
+                _readbackTex = null;
+            }
         }
 
         // ── Bridge control ─────────────────────────────────────────────────────
@@ -90,6 +100,8 @@ namespace MobileBridge
             _receiver.Start();
 
             IsActive = true;
+            StartCoroutine(CaptureLoop());
+
             Debug.Log($"[MobileBridge] Started — WS:{WebSocketServer.WsPort}  HTTP:{WebSocketServer.HttpPort}");
         }
 
@@ -97,6 +109,8 @@ namespace MobileBridge
         {
             if (!IsActive) return;
             IsActive = false;
+
+            // CaptureLoop coroutine checks IsActive and will exit on its own.
 
             _receiver?.Stop();
             _capturer?.Stop();
@@ -119,26 +133,87 @@ namespace MobileBridge
             _receiver?.Tick();
         }
 
-        // ── Frame pipeline (called from main thread by URPCaptureFeature) ──────
+        // ── Frame capture loop ─────────────────────────────────────────────────
 
         /// <summary>
-        /// Called by URPCaptureFeature with raw RGBA32 pixels from AsyncGPUReadback.
-        /// Encodes to JPEG (main thread, see FrameCapturer for context) then enqueues
-        /// for the background send thread.
+        /// Coroutine that captures the complete screen (including Canvas Overlay)
+        /// every frame after Unity has finished compositing everything — including
+        /// Screen Space Overlay canvases — into the final backbuffer.
+        ///
+        /// WaitForEndOfFrame is the only point where ReadPixels can see Overlay UI.
+        /// AsyncGPUReadback from a ScriptableRenderPass fires before Overlay is drawn,
+        /// which is why this approach is required.
+        ///
+        /// Trade-off: ReadPixels is a synchronous GPU stall (~1-3 ms at stream
+        /// resolution). For an Editor-only debug tool this is acceptable.
         /// </summary>
+        private IEnumerator CaptureLoop()
+        {
+            var waitEof = new WaitForEndOfFrame();
+            float interval = 1f / Mathf.Max(targetFps, 1);
+
+            while (IsActive)
+            {
+                // Throttle to targetFps
+                float now = Time.realtimeSinceStartup;
+                if (now - _lastCaptureTime < interval)
+                {
+                    yield return null;
+                    continue;
+                }
+
+                yield return waitEof;   // ← all rendering including Overlay is done here
+
+                if (!IsActive) yield break;
+
+                // Update interval in case targetFps changed at runtime
+                interval = 1f / Mathf.Max(targetFps, 1);
+                _lastCaptureTime = Time.realtimeSinceStartup;
+
+                // Lazy-allocate / resize reusable texture
+                if (_readbackTex == null ||
+                    _readbackTex.width != streamWidth ||
+                    _readbackTex.height != streamHeight)
+                {
+                    if (_readbackTex != null) Destroy(_readbackTex);
+                    _readbackTex = new Texture2D(streamWidth, streamHeight,
+                        TextureFormat.RGB24, false);
+                }
+
+                // ReadPixels reads from the screen backbuffer into the texture.
+                // The Rect maps the centre of the screen at stream resolution,
+                // which handles Game View black bars (letterbox / pillarbox) correctly
+                // as long as the stream dimensions match the Game View aspect ratio.
+                // For a more robust solution consider reading full screen then scaling.
+                int screenW = Screen.width;
+                int screenH = Screen.height;
+                int srcX    = (screenW - streamWidth)  / 2;
+                int srcY    = (screenH - streamHeight) / 2;
+                // Clamp to screen bounds to avoid GL errors
+                srcX = Mathf.Clamp(srcX, 0, screenW);
+                srcY = Mathf.Clamp(srcY, 0, screenH);
+                int readW = Mathf.Min(streamWidth,  screenW - srcX);
+                int readH = Mathf.Min(streamHeight, screenH - srcY);
+
+                _readbackTex.ReadPixels(new Rect(srcX, srcY, readW, readH), 0, 0, false);
+                _readbackTex.Apply(false);
+
+                byte[] jpeg = _readbackTex.EncodeToJPG(jpegQuality);
+                _capturer?.EnqueueJpeg(jpeg);
+            }
+        }
+
+        // ── Legacy callback (kept for API compatibility, no longer used) ────────
+
+        /// <summary>
+        /// Previously called by URPCaptureFeature with raw RGBA32 pixels.
+        /// Now unused — capture is driven by CaptureLoop coroutine.
+        /// Kept to avoid compile errors if any external code references it.
+        /// </summary>
+        [System.Obsolete("Frame capture is now driven by the internal CaptureLoop coroutine. This method is no longer called.")]
         public void OnFrameReady(byte[] rgba32, int width, int height)
         {
-            if (!IsActive || _capturer == null) return;
-
-            // Encode to JPEG using Unity's built-in converter (main thread required).
-            // TODO(P3): move encoding to background thread with a pure-C# JPEG encoder.
-            var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
-            tex.LoadRawTextureData(rgba32);
-            tex.Apply();
-            byte[] jpeg = tex.EncodeToJPG(jpegQuality);
-            Destroy(tex);
-
-            _capturer.EnqueueJpeg(jpeg);
+            // no-op
         }
     }
 }
