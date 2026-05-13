@@ -1,0 +1,28 @@
+{
+  "name": "com.dengxuhui.unity-editor-touch-bridge",
+  "version": "0.1.0",
+  "displayName": "Unity Editor Touch Bridge",
+  "description": "Stream Unity Game View to mobile browser and inject touch input into Unity Input System. No app installation required on mobile — just open a browser.",
+  "unity": "2022.3",
+  "unityRelease": "0f1",
+  "documentationUrl": "https://github.com/dengxuhui/unity-editor-touch-bridge",
+  "changelogUrl": "https://github.com/dengxuhui/unity-editor-touch-bridge/blob/main/CHANGELOG.md",
+  "licensesUrl": "https://github.com/dengxuhui/unity-editor-touch-bridge/blob/main/LICENSE",
+  "dependencies": {
+    "com.unity.inputsystem": "1.7.0",
+    "com.unity.render-pipelines.universal": "14.0.0"
+  },
+  "keywords": [
+    "mobile",
+    "touch",
+    "input",
+    "streaming",
+    "editor",
+    "urp",
+    "websocket"
+  ],
+  "author": {
+    "name": "dengxuhui",
+    "url": "https://github.com/dengxuhui"
+  }
+}
