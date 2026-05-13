@@ -2,6 +2,9 @@
 # UPM Package
 # ========================
 
+# Claude
+.claude/
+
 # macOS
 .DS_Store
 *.DS_Store

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Unity Editor Touch Bridge</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+        #canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+        #status {
+            position: fixed; top: 8px; left: 8px;
+            background: rgba(0,0,0,0.6); color: #fff;
+            font-family: monospace; font-size: 13px;
+            padding: 4px 8px; border-radius: 4px;
+            pointer-events: none; z-index: 10;
+        }
+        #ip-form {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+            background: rgba(20,20,20,0.95); color: #fff; padding: 24px 32px;
+            border-radius: 10px; text-align: center; font-family: sans-serif;
+            z-index: 20;
+        }
+        #ip-form p { margin-bottom: 12px; font-size: 15px; }
+        #ip-form input {
+            padding: 8px 12px; width: 220px; font-size: 16px;
+            border: 1px solid #555; border-radius: 4px;
+            background: #222; color: #fff; margin-bottom: 12px;
+            display: block; margin-left: auto; margin-right: auto;
+        }
+        #ip-form button {
+            padding: 10px 28px; font-size: 15px; cursor: pointer;
+            background: #1a6fff; color: #fff; border: none; border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="status">Connecting…</div>
+    <div id="ip-form" style="display:none">
+        <p>Enter Unity Editor IP address</p>
+        <input id="ip-input" type="text" placeholder="192.168.1.x" inputmode="url" />
+        <button id="connect-btn">Connect</button>
+    </div>
+
+    <script>
+    (function () {
+        const canvas = document.getElementById('canvas');
+        const ctx    = canvas.getContext('2d');
+        const status = document.getElementById('status');
+        const ipForm = document.getElementById('ip-form');
+        const ipInput = document.getElementById('ip-input');
+
+        let ws = null;
+        let reconnectTimer = null;
+        let frameCount = 0;
+        let lastFpsTime = Date.now();
+        let fps = 0;
+
+        function resizeCanvas() {
+            canvas.width  = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        function savedHost() {
+            return localStorage.getItem('bridge_host') || null;
+        }
+
+        function startConnect(host) {
+            if (!host) { ipForm.style.display = 'block'; return; }
+            localStorage.setItem('bridge_host', host);
+            ipForm.style.display = 'none';
+            openWs(host);
+        }
+
+        function openWs(host) {
+            if (ws) { ws.onclose = null; ws.close(); ws = null; }
+            clearTimeout(reconnectTimer);
+
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            status.textContent = 'Connecting…';
+            ws = new WebSocket(`${protocol}//${host}:8765`);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                status.textContent = 'Connected  0 fps';
+                frameCount = 0;
+                lastFpsTime = Date.now();
+            };
+
+            ws.onclose = () => {
+                status.textContent = 'Disconnected — retrying…';
+                reconnectTimer = setTimeout(() => openWs(host), 2000);
+            };
+
+            ws.onerror = () => { status.textContent = 'Connection error'; };
+
+            ws.onmessage = async (e) => {
+                const bitmap = await createImageBitmap(new Blob([e.data], { type: 'image/jpeg' }));
+                requestAnimationFrame(() => {
+                    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+                    bitmap.close();
+                });
+                frameCount++;
+                const now = Date.now();
+                if (now - lastFpsTime >= 1000) {
+                    fps = Math.round(frameCount * 1000 / (now - lastFpsTime));
+                    frameCount = 0;
+                    lastFpsTime = now;
+                    status.textContent = `Connected  ${fps} fps`;
+                }
+            };
+        }
+
+        function sendTouch(eventType, e) {
+            e.preventDefault();
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            const rect = canvas.getBoundingClientRect();
+            const touches = Array.from(e.changedTouches).map(t => ({
+                id: t.identifier,
+                nx: (t.clientX - rect.left) / rect.width,
+                ny: (t.clientY - rect.top)  / rect.height,
+            }));
+            ws.send(JSON.stringify({ type: 'touch', event: eventType, touches }));
+        }
+
+        canvas.addEventListener('touchstart',  e => sendTouch('began',     e), { passive: false });
+        canvas.addEventListener('touchmove',   e => sendTouch('moved',     e), { passive: false });
+        canvas.addEventListener('touchend',    e => sendTouch('ended',     e), { passive: false });
+        canvas.addEventListener('touchcancel', e => sendTouch('cancelled', e), { passive: false });
+
+        document.getElementById('connect-btn').addEventListener('click', () => {
+            const h = ipInput.value.trim();
+            if (h) startConnect(h);
+        });
+        ipInput.addEventListener('keydown', e => {
+            if (e.key === 'Enter') { const h = ipInput.value.trim(); if (h) startConnect(h); }
+        });
+
+        // Auto-connect: use page hostname if not localhost, else check localStorage
+        const autoHost = (location.hostname && location.hostname !== 'localhost')
+            ? location.hostname
+            : savedHost();
+        startConnect(autoHost);
+    })();
+    </script>
+</body>
+</html>

@@ -2,7 +2,9 @@
     "name": "MobileBridge.Editor",
     "rootNamespace": "MobileBridge.Editor",
     "references": [
-        "MobileBridge.Runtime"
+        "MobileBridge.Runtime",
+        "Unity.RenderPipelines.Universal.Runtime",
+        "Unity.RenderPipelines.Universal.Editor"
     ],
     "includePlatforms": [
         "Editor"
