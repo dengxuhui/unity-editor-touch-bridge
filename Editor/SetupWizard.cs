@@ -112,7 +112,7 @@ namespace MobileBridge.Editor
 
             if (GUILayout.Button(exists ? "Regenerate Certificate" : "Generate Certificate"))
             {
-                CertificateHelper.Generate();
+                CertificateGenerator.Generate();
                 _log = $"Certificate saved to:\n{CertificateHelper.CertPath}";
             }
 

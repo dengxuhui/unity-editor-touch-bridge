@@ -1,37 +1,34 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Net;
-using System.Net.WebSockets;
-using System.Text;
-using System.Threading;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using UnityEngine;
+using WebSocketSharp;
+using WebSocketSharp.Net;
+using WebSocketSharp.Server;
 
 namespace MobileBridge
 {
     /// <summary>
-    /// Runs two listeners:
-    ///   port 8765 — WebSocket (WS/WSS): binary frame push down, JSON touch up
-    ///   port 8766 — HTTP/HTTPS: serves client.html on GET /
+    /// Runs two TLS-enabled servers:
+    ///   port 8765 — WebSocket (WSS): binary frame push down, JSON touch up
+    ///   port 8766 — HTTPS static file server: serves client.html on GET /
+    ///                                          serves cert as DER on GET /cert
     /// </summary>
     public sealed class WebSocketServer : IDisposable
     {
         public const int WsPort   = 8765;
         public const int HttpPort = 8766;
 
-        private HttpListener _wsListener;
-        private HttpListener _httpListener;
-        private readonly List<WebSocket> _clients = new List<WebSocket>();
-        private readonly object _clientsLock = new object();
-        private CancellationTokenSource _cts;
-
-        private readonly string _clientHtmlPath;
-        private bool _disposed;
+        private WebSocketSharp.Server.WebSocketServer _wsServer;
+        private HttpServer                             _httpServer;
+        private readonly string                        _clientHtmlPath;
+        private bool                                   _disposed;
 
         public event Action<string> OnTouchMessage;
 
-        public int ClientCount { get { lock (_clientsLock) return _clients.Count; } }
+        public int ClientCount =>
+            _wsServer?.WebSocketServices["/"]?.Sessions.Count ?? 0;
 
         public WebSocketServer(string clientHtmlPath)
         {
@@ -40,184 +37,39 @@ namespace MobileBridge
 
         public void Start()
         {
-            _cts = new CancellationTokenSource();
+            var cert = CertificateHelper.Load();
+            if (cert == null)
+                throw new InvalidOperationException(
+                    "[MobileBridge] No TLS certificate found. " +
+                    "Please generate one first via Window > Mobile Bridge > Generate Certificate.");
 
-            _wsListener = new HttpListener();
-            _wsListener.Prefixes.Add($"http://+:{WsPort}/");
-            _wsListener.Start();
+            // ── WebSocket server (port 8765, WSS) ─────────────────────────────
+            _wsServer = new WebSocketSharp.Server.WebSocketServer(WsPort, secure: true);
+            ConfigureSsl(_wsServer.SslConfiguration, cert);
+            _wsServer.AddWebSocketService<BridgeBehavior>("/", b => b.Init(FireTouchMessage));
+            _wsServer.Start();
 
-            _httpListener = new HttpListener();
-            _httpListener.Prefixes.Add($"http://+:{HttpPort}/");
-            _httpListener.Start();
+            // ── HTTP server (port 8766, HTTPS) ────────────────────────────────
+            _httpServer = new HttpServer(HttpPort, secure: true);
+            ConfigureSsl(_httpServer.SslConfiguration, cert);
+            _httpServer.OnGet += HandleHttpGet;
+            _httpServer.Start();
 
-            Task.Run(() => AcceptWsLoop(_cts.Token));
-            Task.Run(() => AcceptHttpLoop(_cts.Token));
-
-            Debug.Log($"[MobileBridge] WS  listening on :{WsPort}");
-            Debug.Log($"[MobileBridge] HTTP listening on :{HttpPort}");
+            Debug.Log($"[MobileBridge] WSS  listening on :{WsPort}");
+            Debug.Log($"[MobileBridge] HTTPS listening on :{HttpPort}");
         }
 
         public void Stop()
         {
-            _cts?.Cancel();
-            try { _wsListener?.Stop(); }   catch { }
-            try { _httpListener?.Stop(); } catch { }
-
-            lock (_clientsLock)
-            {
-                foreach (var c in _clients)
-                {
-                    try { c.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None).Wait(200); }
-                    catch { }
-                    c.Dispose();
-                }
-                _clients.Clear();
-            }
+            try { _wsServer?.Stop(); }   catch { }
+            try { _httpServer?.Stop(); } catch { }
         }
 
-        /// <summary>Enqueue a JPEG frame for all connected clients (call from any thread).</summary>
-        public async Task BroadcastFrameAsync(byte[] jpegBytes)
+        /// <summary>Broadcast a JPEG frame to all connected clients.</summary>
+        public Task BroadcastFrameAsync(byte[] jpegBytes)
         {
-            List<WebSocket> snapshot;
-            lock (_clientsLock) snapshot = new List<WebSocket>(_clients);
-
-            if (snapshot.Count == 0) return;
-
-            var segment = new ArraySegment<byte>(jpegBytes);
-            var toRemove = new List<WebSocket>();
-
-            foreach (var ws in snapshot)
-            {
-                if (ws.State != WebSocketState.Open) { toRemove.Add(ws); continue; }
-                try
-                {
-                    await ws.SendAsync(segment, WebSocketMessageType.Binary, true, _cts.Token);
-                }
-                catch
-                {
-                    toRemove.Add(ws);
-                }
-            }
-
-            if (toRemove.Count > 0)
-                lock (_clientsLock)
-                    foreach (var ws in toRemove)
-                        _clients.Remove(ws);
-        }
-
-        // ── WebSocket accept loop ──────────────────────────────────────────────
-
-        private async Task AcceptWsLoop(CancellationToken ct)
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                HttpListenerContext ctx;
-                try { ctx = await _wsListener.GetContextAsync(); }
-                catch (Exception) { break; }
-
-                if (ctx.Request.IsWebSocketRequest)
-                    _ = Task.Run(() => HandleWsClient(ctx, ct), ct);
-                else
-                {
-                    ctx.Response.StatusCode = 426;
-                    ctx.Response.Close();
-                }
-            }
-        }
-
-        private async Task HandleWsClient(HttpListenerContext ctx, CancellationToken ct)
-        {
-            WebSocket ws;
-            try
-            {
-                var wsCtx = await ctx.AcceptWebSocketAsync(null);
-                ws = wsCtx.WebSocket;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[MobileBridge] WS handshake failed: {ex.Message}");
-                ctx.Response.Close();
-                return;
-            }
-
-            lock (_clientsLock) _clients.Add(ws);
-            Debug.Log($"[MobileBridge] Client connected. Total: {ClientCount}");
-
-            var buf = new byte[8192];
-            try
-            {
-                while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
-                {
-                    var result = await ws.ReceiveAsync(new ArraySegment<byte>(buf), ct);
-                    if (result.MessageType == WebSocketMessageType.Close) break;
-                    if (result.MessageType == WebSocketMessageType.Text)
-                    {
-                        var msg = Encoding.UTF8.GetString(buf, 0, result.Count);
-                        OnTouchMessage?.Invoke(msg);
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception ex) { Debug.LogWarning($"[MobileBridge] WS recv error: {ex.Message}"); }
-            finally
-            {
-                lock (_clientsLock) _clients.Remove(ws);
-                Debug.Log($"[MobileBridge] Client disconnected. Total: {ClientCount}");
-                try
-                {
-                    if (ws.State == WebSocketState.Open)
-                        await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
-                }
-                catch { }
-                ws.Dispose();
-            }
-        }
-
-        // ── HTTP accept loop ───────────────────────────────────────────────────
-
-        private async Task AcceptHttpLoop(CancellationToken ct)
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                HttpListenerContext ctx;
-                try { ctx = await _httpListener.GetContextAsync(); }
-                catch (Exception) { break; }
-
-                _ = Task.Run(() => ServeHttp(ctx));
-            }
-        }
-
-        private void ServeHttp(HttpListenerContext ctx)
-        {
-            try
-            {
-                var path = ctx.Request.Url?.AbsolutePath ?? "/";
-                if (path == "/" || path == "/index.html")
-                {
-                    if (File.Exists(_clientHtmlPath))
-                    {
-                        var html = File.ReadAllBytes(_clientHtmlPath);
-                        ctx.Response.ContentType       = "text/html; charset=utf-8";
-                        ctx.Response.ContentLength64   = html.Length;
-                        ctx.Response.OutputStream.Write(html, 0, html.Length);
-                    }
-                    else
-                    {
-                        ctx.Response.StatusCode = 503;
-                        var msg = Encoding.UTF8.GetBytes("client.html not found");
-                        ctx.Response.OutputStream.Write(msg, 0, msg.Length);
-                    }
-                }
-                else
-                {
-                    ctx.Response.StatusCode = 404;
-                }
-            }
-            catch (Exception ex) { Debug.LogWarning($"[MobileBridge] HTTP error: {ex.Message}"); }
-            finally
-            {
-                try { ctx.Response.Close(); } catch { }
-            }
+            _wsServer?.WebSocketServices["/"]?.Sessions.Broadcast(jpegBytes);
+            return Task.CompletedTask;
         }
 
         public void Dispose()
@@ -225,7 +77,115 @@ namespace MobileBridge
             if (_disposed) return;
             _disposed = true;
             Stop();
-            _cts?.Dispose();
+        }
+
+        // ── SSL configuration helper ───────────────────────────────────────────
+
+        private static void ConfigureSsl(WebSocketSharp.Net.ServerSslConfiguration ssl, X509Certificate2 cert)
+        {
+            ssl.ServerCertificate = cert;
+            ssl.EnabledSslProtocols =
+                System.Security.Authentication.SslProtocols.Tls12;
+            // Client does not send a certificate; accept all (iOS user-installed cert)
+            ssl.ClientCertificateValidationCallback = (_, __, ___, ____) => true;
+        }
+
+        // ── HTTP request handler ───────────────────────────────────────────────
+
+        private void HandleHttpGet(object sender, HttpRequestEventArgs e)
+        {
+            var req  = e.Request;
+            var res  = e.Response;
+            var path = req.RawUrl?.Split('?')[0] ?? "/";
+
+            try
+            {
+                if (path == "/" || path == "/index.html")
+                {
+                    ServeClientHtml(res);
+                }
+                else if (path == "/cert")
+                {
+                    ServeCert(res);
+                }
+                else
+                {
+                    res.StatusCode = 404;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[MobileBridge] HTTP error: {ex.Message}");
+                res.StatusCode = 500;
+            }
+        }
+
+        private void ServeClientHtml(HttpListenerResponse res)
+        {
+            if (File.Exists(_clientHtmlPath))
+            {
+                var html = File.ReadAllBytes(_clientHtmlPath);
+                res.ContentType     = "text/html; charset=utf-8";
+                res.ContentLength64 = html.Length;
+                res.OutputStream.Write(html, 0, html.Length);
+            }
+            else
+            {
+                res.StatusCode = 503;
+                var msg = System.Text.Encoding.UTF8.GetBytes("client.html not found");
+                res.OutputStream.Write(msg, 0, msg.Length);
+            }
+        }
+
+        private static void ServeCert(HttpListenerResponse res)
+        {
+            try
+            {
+                var cert    = CertificateHelper.Load();
+                var derBytes = cert.Export(X509ContentType.Cert); // DER, public key only
+                res.ContentType = "application/x-x509-ca-cert";
+                res.Headers.Add("Content-Disposition", "attachment; filename=\"mobileBridge.cer\"");
+                res.ContentLength64 = derBytes.Length;
+                res.OutputStream.Write(derBytes, 0, derBytes.Length);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[MobileBridge] /cert error: {ex.Message}");
+                res.StatusCode = 500;
+            }
+        }
+
+        // ── Touch message relay ────────────────────────────────────────────────
+
+        private void FireTouchMessage(string msg) => OnTouchMessage?.Invoke(msg);
+
+        // ── WebSocket behaviour ────────────────────────────────────────────────
+
+        private sealed class BridgeBehavior : WebSocketBehavior
+        {
+            private Action<string> _onMessage;
+
+            public void Init(Action<string> onMessage) { _onMessage = onMessage; }
+
+            protected override void OnOpen()
+            {
+                Debug.Log("[MobileBridge] Client connected.");
+            }
+
+            protected override void OnClose(CloseEventArgs e)
+            {
+                Debug.Log($"[MobileBridge] Client disconnected (code={e.Code}).");
+            }
+
+            protected override void OnError(WebSocketSharp.ErrorEventArgs e)
+            {
+                Debug.LogWarning($"[MobileBridge] WS error: {e.Message}");
+            }
+
+            protected override void OnMessage(MessageEventArgs e)
+            {
+                if (e.IsText) _onMessage?.Invoke(e.Data);
+            }
         }
     }
 }

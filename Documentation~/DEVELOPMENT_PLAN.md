@@ -112,8 +112,8 @@
 | 阶段 | 状态 | 开始时间 | 完成时间 | 备注 |
 |------|------|----------|----------|------|
 | P0 基线对齐 | DONE | 2026-05-13 | 2026-05-13 | 全量源码实现，通过五项核对 |
-| P1 基础链路打通 | TODO | - | - | - |
-| P2 平台稳定性 | TODO | - | - | - |
+| P1 基础链路打通 | DONE | 2026-05-13 | 2026-05-13 | iOS Safari wss:// 验收通过；Android ws:// 留 P2 补充验证 |
+| P2 平台稳定性 | IN_PROGRESS | 2026-05-13 | - | 证书生成/加载 Mono 兼容性已修复；URPCaptureFeature handle 访问时序已修复 |
 | P3 性能与体验 | TODO | - | - | - |
 | P4 发布准备 | TODO | - | - | - |
 
@@ -123,3 +123,6 @@
 |------|------|------|------|
 | 2026-05-13 | P0 | 初始化开发计划 | 新增本文档并设为后续开发执行基准 |
 | 2026-05-13 | P0 | 全量源码实现 | 创建 Runtime/Core、Runtime/Capture、Runtime/Network、Editor、WebClient 全部源文件（11 个 .cs + client.html），通过目录职责/端口/URP注入条件/帧捕获三段式/触控协议五项核对；JPEG 编码暂在主线程（P3 优化） |
+| 2026-05-13 | P1 | 基础链路打通 | T1 引入 websocket-sharp.dll；T2 CertificateHelper 补充局域网 IP 到 SAN；T3 WebSocketServer 基于 websocket-sharp 重写（WSS 8765 + HTTPS 8766 + /cert 端点）；T4 URPCaptureFeature/MobileBridge 生命周期守卫；T5 Editor 窗口 https:// + DrawCertificate() + NeedsRenewal()；T6 client.html wss 连接失败提示 |
+| 2026-05-13 | P2 | 证书生成 Mono 兼容性修复（三轮） | **根本问题**：Unity 2022.3 Mono 大量 `System.Security.Cryptography` API 为未实现 stub。**第一轮**：`CertificateRequest` 抛 `PlatformNotSupportedException` → 引入 BouncyCastle 2.4.0（`Editor/Plugins/`，Editor only）；**第二轮**：BouncyCastle 生成的 PKCS#12 中 RC2-40-CBC 证书袋 Mono 无法解析 → 改为 cert.pem（DER）+ key.pem（PKCS#8）存储；**第三轮**：`ImportPkcs8PrivateKey` 也是 stub → 改为 cert.pem + key-params.xml（RSA XML）存储，生成端用 `DotNetUtilities.ToRSA()` + `ToXmlString(true)`，加载端用 `RSACryptoServiceProvider.FromXmlString()`。职责拆分：`CertificateGenerator`（Editor only，依赖 BouncyCastle）负责生成；`CertificateHelper`（Runtime，无外部依赖）负责加载。 |
+| 2026-05-13 | P2 | URPCaptureFeature handle 访问时序修复 | `AddRenderPasses` 中访问 `renderer.cameraColorTargetHandle` 抛错（URP 2022.3 明确禁止）。修复：`AddRenderPasses` 只做 `EnqueuePass`；`SetupRenderPasses` 中调用 `_pass.Setup(renderer.cameraColorTargetHandle)`，此时 handle 已合法。同步修复 `in RenderingData` 参数不能用 `ref var` 取引用（CS8330）。 |

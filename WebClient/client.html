@@ -56,6 +56,7 @@
         let frameCount = 0;
         let lastFpsTime = Date.now();
         let fps = 0;
+        let everConnected = false;
 
         function resizeCanvas() {
             canvas.width  = window.innerWidth;
@@ -78,6 +79,7 @@
         function openWs(host) {
             if (ws) { ws.onclose = null; ws.close(); ws = null; }
             clearTimeout(reconnectTimer);
+            everConnected = false;
 
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
             status.textContent = 'Connecting…';
@@ -85,6 +87,7 @@
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
+                everConnected = true;
                 status.textContent = 'Connected  0 fps';
                 frameCount = 0;
                 lastFpsTime = Date.now();
@@ -95,7 +98,18 @@
                 reconnectTimer = setTimeout(() => openWs(host), 2000);
             };
 
-            ws.onerror = () => { status.textContent = 'Connection error'; };
+            ws.onerror = () => {
+                if (!everConnected && location.protocol === 'https:') {
+                    const certUrl = `${location.protocol}//${location.hostname}:${location.port ? location.port.replace('8766','8766') : '8766'}/cert`;
+                    const httpPort = 8766;
+                    status.innerHTML =
+                        'Connection failed. You may need to install the certificate first.<br>' +
+                        `Open in Safari: <a href="https://${location.hostname}:${httpPort}/cert" ` +
+                        `style="color:#6af">https://${location.hostname}:${httpPort}/cert</a>`;
+                } else {
+                    status.textContent = 'Connection error';
+                }
+            };
 
             ws.onmessage = async (e) => {
                 const bitmap = await createImageBitmap(new Blob([e.data], { type: 'image/jpeg' }));

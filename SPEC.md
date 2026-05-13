@@ -67,7 +67,8 @@
 | `TouchReceiver.cs` | C# | WebSocket 服务端接收触控坐标，注入 Unity Input System |
 | `CoordinateMapper.cs` | C# | 三坐标系换算，处理 Y 轴翻转和黑边偏移 |
 | `MobileBridgeWindow.cs` | C# (Editor) | Editor 控制面板，显示连接状态、二维码、配置参数 |
-| `CertificateHelper.cs` | C# (Editor) | 自动生成自签名证书，支持 iOS WSS 连接 |
+| `CertificateGenerator.cs` | C# (Editor only) | 用 BouncyCastle 生成自签 SSL 证书并写 cert.pem + key-params.xml |
+| `CertificateHelper.cs` | C# (Runtime) | 加载 cert.pem + key-params.xml，组装带私钥的 X509Certificate2 |
 | `client.html` | HTML/JS | 手机端单文件网页，Canvas 渲染 + Touch 采集 |
 
 ---
@@ -80,7 +81,7 @@ unity-mobile-bridge/                    ← Git 仓库根目录
 ├── README.md
 ├── CHANGELOG.md
 │
-├── Runtime/                            ← 运行时代码
+├── Runtime/                            ← 运行时代码（会进入玩家构建包）
 │   ├── Core/
 │   │   ├── MobileBridge.cs             ← 主入口，生命周期管理
 │   │   ├── FrameCapturer.cs            ← 画面捕获与推流
@@ -89,14 +90,19 @@ unity-mobile-bridge/                    ← Git 仓库根目录
 │   ├── Capture/
 │   │   └── URPCaptureFeature.cs        ← ScriptableRendererFeature 实现
 │   ├── Network/
-│   │   ├── WebSocketServer.cs          ← 基于 System.Net.WebSockets
-│   │   └── CertificateHelper.cs        ← 自签证书生成（WSS 用）
+│   │   ├── WebSocketServer.cs          ← 基于 websocket-sharp
+│   │   └── CertificateHelper.cs        ← 加载证书（cert.pem + key-params.xml）
+│   ├── Plugins/
+│   │   └── websocket-sharp.dll         ← Runtime 依赖
 │   └── MobileBridge.Runtime.asmdef
 │
-├── Editor/
+├── Editor/                             ← Editor Only（不进入玩家构建包）
 │   ├── MobileBridgeWindow.cs           ← Editor 控制面板
 │   ├── SetupWizard.cs                  ← 首次配置向导
 │   ├── QRCodeGenerator.cs              ← 二维码生成
+│   ├── CertificateGenerator.cs         ← BouncyCastle 证书生成（Editor only）
+│   ├── Plugins/
+│   │   └── BouncyCastle.Cryptography.dll ← Editor only，所有玩家平台已排除
 │   └── MobileBridge.Editor.asmdef      ← Editor Only
 │
 ├── WebClient/
@@ -136,13 +142,11 @@ unity-mobile-bridge/                    ← Git 仓库根目录
 ```csharp
 public class URPCaptureFeature : ScriptableRendererFeature
 {
-    private CaptureRenderPass _capturePass;
+    private CapturePass _pass;
 
     public override void Create()
     {
-        _capturePass = new CaptureRenderPass();
-        // 在所有后处理完成后执行，画面已完整
-        _capturePass.renderPassEvent = RenderPassEvent.AfterRendering;
+        _pass = new CapturePass { renderPassEvent = RenderPassEvent.AfterRendering };
     }
 
     public override void AddRenderPasses(ScriptableRenderer renderer,
@@ -156,7 +160,21 @@ public class URPCaptureFeature : ScriptableRendererFeature
         bool isGameView   = renderingData.cameraData.cameraType == CameraType.Game;
 
         if (isBaseCamera && isGameView && MobileBridge.IsActive)
-            renderer.EnqueuePass(_capturePass);
+            renderer.EnqueuePass(_pass);
+        // 注意：不在此处访问 renderer.cameraColorTargetHandle，
+        // 该 handle 在 AddRenderPasses 阶段尚未准备好。
+    }
+
+    // SetupRenderPasses 在所有 pass 入队后、渲染开始前调用，
+    // 此时 cameraColorTargetHandle 已合法，可安全传递给 pass。
+    public override void SetupRenderPasses(ScriptableRenderer renderer,
+                                            in RenderingData renderingData)
+    {
+        bool isBaseCamera = renderingData.cameraData.renderType == CameraRenderType.Base;
+        bool isGameView   = renderingData.cameraData.cameraType == CameraType.Game;
+
+        if (isBaseCamera && isGameView && MobileBridge.IsActive)
+            _pass.Setup(renderer.cameraColorTargetHandle);
     }
 }
 ```
@@ -343,13 +361,39 @@ iOS Safari 对 `ws://`（明文）存在限制，需使用 `wss://`（加密连�
 **自签证书流程（Setup Wizard 自动完成）：**
 
 ```
-1. 首次启动，CertificateHelper 自动生成本机自签 SSL 证书
+1. 首次启动，Editor 侧 CertificateGenerator（BouncyCastle）自动生成本机自签 SSL 证书
 2. Editor 面板显示引导：
    「请用手机浏览器访问 https://[IP]:8766/cert，
      按提示安装描述文件（仅需操作一次）」
 3. 安装后，wss:// 连接正常工作
 4. 证书有效期 365 天，过期后 Setup Wizard 自动重新生成
 ```
+
+**证书存储格式：**
+
+证书以两个文件形式存储在 `Application.persistentDataPath/MobileBridge/`：
+
+| 文件 | 内容 | 格式 |
+|------|------|------|
+| `cert.pem` | X.509 公钥证书 | DER base64 PEM |
+| `key-params.xml` | RSA 私钥参数 | RSACryptoServiceProvider XML |
+
+**为什么不用 PFX / PKCS#12？**
+
+Unity 2022.3 的 Mono 运行时无法可靠解析 BouncyCastle 生成的 PKCS#12 文件（BouncyCastle 默认使用 RC2-40-CBC 加密证书袋，Mono 不支持）。同理，`ImportPkcs8PrivateKey` 等现代 API 在 Mono 上均为未实现的 stub，会抛 `PlatformNotSupportedException`。
+
+**为什么私钥用 XML 格式？**
+
+`RSACryptoServiceProvider.FromXmlString()` 是 Mono 上少数**真正实现**的私钥导入 API，可直接接受包含全部 RSA 参数的 XML 字符串，无需依赖任何外部库。
+
+**职责分离（零侵入原则）：**
+
+| 模块 | 位置 | 职责 |
+|------|------|------|
+| `CertificateGenerator` | `Editor/`（Editor only） | 用 BouncyCastle 生成密钥对和证书，写 cert.pem + key-params.xml |
+| `CertificateHelper` | `Runtime/Network/`（Runtime） | 读 cert.pem（PEM 解码）+ key-params.xml（FromXmlString），组装带私钥的 `X509Certificate2` |
+
+BouncyCastle DLL（`Editor/Plugins/BouncyCastle.Cryptography.dll`）仅在 Editor 中使用，所有玩家平台均已排除，不进入用户构建包。
 
 **Android Chrome：** 直接使用 `ws://`，无需证书，零配置。
 

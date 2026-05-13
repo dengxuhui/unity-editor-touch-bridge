@@ -27,11 +27,19 @@ namespace MobileBridge
             bool isBase     = camData.renderType == CameraRenderType.Base;
             bool isGameView = camData.cameraType == CameraType.Game;
 
-            if (isBase && isGameView && MobileBridge.IsActive)
-            {
-                _pass.Setup(renderer.cameraColorTargetHandle);
+            if (_pass != null && isBase && isGameView && MobileBridge.IsActive)
                 renderer.EnqueuePass(_pass);
-            }
+        }
+
+        // SetupRenderPasses is called after all passes have been enqueued,
+        // at which point cameraColorTargetHandle is valid to access.
+        public override void SetupRenderPasses(ScriptableRenderer renderer, in RenderingData renderingData)
+        {
+            bool isBase     = renderingData.cameraData.renderType == CameraRenderType.Base;
+            bool isGameView = renderingData.cameraData.cameraType == CameraType.Game;
+
+            if (_pass != null && isBase && isGameView && MobileBridge.IsActive)
+                _pass.Setup(renderer.cameraColorTargetHandle);
         }
 
         protected override void Dispose(bool disposing)

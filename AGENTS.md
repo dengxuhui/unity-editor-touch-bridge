@@ -67,6 +67,41 @@ bool isGameView   = renderingData.cameraData.cameraType == CameraType.Game;
 ```
 `nx`/`ny` 为归一化坐标，通过 `InputSystem.QueueStateEvent` 注入，系统鼠标不动。
 
+## 零侵入原则（硬性约束，不得违反）
+
+本插件是**纯编辑器辅助工具**，对用户项目的最终构建必须零影响。以下规则在任何情况下不得违反：
+
+### 构建隔离
+
+- **任何仅在 Editor 内使用的逻辑，必须放在 `Editor/` 目录或 Editor-only asmdef 中**，不得放在 `Runtime/`。
+- `Runtime/` 下的代码和 DLL **会被编译进用户的最终游戏包（Android APK / iOS IPA / PC 构建）**，必须严格控制其内容。
+- 新增第三方 DLL 时，必须判断其使用场景：
+  - 仅 Editor 使用 → 放 `Editor/Plugins/`，不得放 `Runtime/Plugins/`
+  - 运行时必需 → 放 `Runtime/Plugins/`，并在 PR/commit 中明确说明理由和体积影响
+- **禁止**将证书生成、QR 码生成、UI 渲染、Setup Wizard 等 Editor-only 功能的依赖库混入 `Runtime/`。
+
+### asmdef 边界
+
+| asmdef | 允许的内容 | 禁止的内容 |
+|--------|-----------|-----------|
+| `MobileBridge.Runtime` | 运行时必需逻辑（WebSocket 收发、帧捕获、触控注入、证书**加载**） | 证书**生成**、Editor GUI、任何 `UnityEditor.*` 引用 |
+| `MobileBridge.Editor` | 所有 Editor 窗口、向导、工具类、证书**生成** | 任何会被打包进玩家构建的逻辑 |
+
+### 拆分原则（以 CertificateHelper 为范例）
+
+当一个类同时包含"Editor 操作"和"运行时操作"时，必须拆分：
+
+```
+Runtime/Network/CertificateHelper.cs   ← 只保留 Load / Check（CertExists, NeedsRenewal, LoadOrCreate）
+Editor/CertificateGenerator.cs         ← 只保留 Generate()，可依赖 Editor-only 第三方库
+```
+
+### 用户项目不可感知
+
+- 插件不得在用户项目的 Player Settings、Build Settings、场景中自动写入任何持久化配置。
+- 不得在用户的 `Assets/` 目录下创建任何文件；运行时生成的文件（证书、临时文件）只允许写入 `Application.persistentDataPath`（沙盒路径，不影响项目）。
+- 不得修改用户项目的 URP Renderer Asset 或其他 ScriptableObject，除非用户通过 Setup Wizard **明确确认**。
+
 ## 设计文档
 
 详细技术规格见 `SPEC.md`，包含：完整架构图、各模块伪代码、性能指标、黑边处理、跨平台差异、已知限制。**开发前务必阅读。**
