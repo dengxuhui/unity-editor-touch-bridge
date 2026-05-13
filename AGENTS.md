@@ -9,7 +9,7 @@
 - **包名**：`com.dengxuhui.unity-editor-touch-bridge`
 - **Unity 最低版本**：2022.3 LTS
 - **强依赖**：URP 14.0+、Input System 1.7.0+（仅支持 URP，Built-in RP / HDRP 无法使用）
-- **开发用 Unity 工程**：`Sandbox/`（不随包发布，`.gitignore` 已屏蔽 Library 等生成目录）
+- **开发用 Unity 工程**：`Sandbox~/`（不随包发布，`~` 后缀使 Unity 跳过导入，`.gitignore` 已屏蔽 Library 等生成目录）
 
 ## 目录职责（不要搞混）
 
@@ -20,7 +20,7 @@
 | `Runtime/Network/` | `WebSocketServer.cs`、`CertificateHelper.cs`（无第三方依赖，基于 `System.Net.WebSockets`） |
 | `Editor/` | `MobileBridgeWindow.cs`、`SetupWizard.cs`、`QRCodeGenerator.cs`（Editor Only asmdef） |
 | `WebClient/` | `client.html`（手机端单文件网页，随包分发，运行时 serve） |
-| `Sandbox/` | 本地开发测试用 Unity 工程，**不是包的一部分** |
+| `Sandbox~/` | 本地开发测试用 Unity 工程，**不是包的一部分**，`~/` 后缀使 Unity 不导入此目录 |
 | `Documentation~/` | 文档，`~/` 后缀使 Unity 不导入此目录 |
 | `Samples~/` | 示例场景，同上 |
 
@@ -70,3 +70,7 @@ bool isGameView   = renderingData.cameraData.cameraType == CameraType.Game;
 ## 设计文档
 
 详细技术规格见 `SPEC.md`，包含：完整架构图、各模块伪代码、性能指标、黑边处理、跨平台差异、已知限制。**开发前务必阅读。**
+
+## 阶段开发计划（执行基准）
+
+后续开发请以 `Documentation~/DEVELOPMENT_PLAN.md` 为执行基准，按阶段逐步推进并更新状态。若计划与实现不一致，优先修正文档后再改代码。
