@@ -28,8 +28,7 @@ namespace MobileBridge.Editor
         // Settings (mirrored to/from MobileBridge component)
         private int   _targetFps    = 30;
         private int   _jpegQuality  = 75;
-        private int   _streamWidthIndex  = 1;   // default 960×540
-        private int   _streamHeightIndex = 1;
+        private int   _streamWidthIndex  = 1;   // default 960×540, height via ResHeights[index]
 
         private static readonly string[] ResLabels = { "640×360", "960×540", "1280×720" };
         private static readonly int[] ResWidths    = { 640, 960, 1280 };

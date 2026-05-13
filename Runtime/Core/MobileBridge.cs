@@ -110,6 +110,15 @@ namespace MobileBridge
             Debug.Log("[MobileBridge] Stopped.");
         }
 
+        // ── MonoBehaviour update ───────────────────────────────────────────────
+
+        private void Update()
+        {
+            // Drain touch events queued by the WS thread onto the main thread,
+            // where QueueStateEvent (Allocator.Temp) is permitted.
+            _receiver?.Tick();
+        }
+
         // ── Frame pipeline (called from main thread by URPCaptureFeature) ──────
 
         /// <summary>
