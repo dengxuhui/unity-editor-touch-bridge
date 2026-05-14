@@ -9,15 +9,21 @@ namespace MobileBridge
     /// Receives JPEG-encoded frames from the main thread and sends them
     /// to all WebSocket clients via a dedicated background send thread.
     ///
-    /// Three-step pipeline (SPEC §4.2):
-    ///   ① URPCaptureFeature.Execute  → AsyncGPUReadback (non-blocking, main thread)
-    ///   ② OnReadbackComplete callback → JPEG encode + EnqueueJpeg (main thread)
-    ///   ③ This class (background thread) → WebSocket send
+    /// Pipeline (current implementation):
+    ///   ① MobileBridge.CaptureLoop (main thread, WaitForEndOfFrame)
+    ///        → ReadPixels (sync GPU readback, ~1–3 ms at stream resolution)
+    ///        → EncodeToJPG
+    ///        → EnqueueJpeg
+    ///   ② This class (background thread) → WebSocket broadcast
     ///
-    /// JPEG encoding is done in step ② on the main thread using Unity's built-in
-    /// ImageConversion to avoid cross-platform System.Drawing dependencies.
-    /// Moving encoding to a worker thread (P3 optimisation) requires a pure-C#
-    /// JPEG encoder or a native plugin.
+    /// WaitForEndOfFrame is used instead of AsyncGPUReadback so that
+    /// Screen Space Overlay canvases are included in the captured frame.
+    /// AsyncGPUReadback fires inside the URP render pass, before Overlay UI
+    /// is composited, which caused 2D UI to be invisible in the stream.
+    ///
+    /// Trade-off: ReadPixels + EncodeToJPG run on the main thread (~3–8 ms).
+    /// For a P3 optimisation, encoding could be moved to a worker thread using
+    /// a pure-C# JPEG encoder or a native plugin.
     /// </summary>
     public sealed class FrameCapturer
     {
@@ -54,7 +60,7 @@ namespace MobileBridge
 
         /// <summary>
         /// Enqueue an already-encoded JPEG for broadcasting.
-        /// Called from the main thread (AsyncGPUReadback callback).
+        /// Called from the main thread (CaptureLoop coroutine).
         /// </summary>
         public void EnqueueJpeg(byte[] jpegBytes)
         {

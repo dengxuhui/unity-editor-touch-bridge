@@ -29,8 +29,6 @@ namespace MobileBridge
         [Header("Streaming")]
         [Range(1, 60)]  public int   targetFps    = 30;
         [Range(1, 100)] public int   jpegQuality  = 75;
-        [Range(320, 1920)] public int streamWidth  = 960;
-        [Range(180, 1080)] public int streamHeight = 540;
 
         // ── Internal references ────────────────────────────────────────────────
 
@@ -154,6 +152,14 @@ namespace MobileBridge
 
             while (IsActive)
             {
+                // Skip capture entirely when no client is connected — avoids
+                // wasting CPU/GPU on ReadPixels + JPEG encode with nobody to receive.
+                if (ClientCount == 0)
+                {
+                    yield return null;
+                    continue;
+                }
+
                 // Throttle to targetFps
                 float now = Time.realtimeSinceStartup;
                 if (now - _lastCaptureTime < interval)
@@ -170,32 +176,27 @@ namespace MobileBridge
                 interval = 1f / Mathf.Max(targetFps, 1);
                 _lastCaptureTime = Time.realtimeSinceStartup;
 
-                // Lazy-allocate / resize reusable texture
-                if (_readbackTex == null ||
-                    _readbackTex.width != streamWidth ||
-                    _readbackTex.height != streamHeight)
-                {
-                    if (_readbackTex != null) Destroy(_readbackTex);
-                    _readbackTex = new Texture2D(streamWidth, streamHeight,
-                        TextureFormat.RGB24, false);
-                }
-
-                // ReadPixels reads from the screen backbuffer into the texture.
-                // The Rect maps the centre of the screen at stream resolution,
-                // which handles Game View black bars (letterbox / pillarbox) correctly
-                // as long as the stream dimensions match the Game View aspect ratio.
-                // For a more robust solution consider reading full screen then scaling.
                 int screenW = Screen.width;
                 int screenH = Screen.height;
-                int srcX    = (screenW - streamWidth)  / 2;
-                int srcY    = (screenH - streamHeight) / 2;
-                // Clamp to screen bounds to avoid GL errors
-                srcX = Mathf.Clamp(srcX, 0, screenW);
-                srcY = Mathf.Clamp(srcY, 0, screenH);
-                int readW = Mathf.Min(streamWidth,  screenW - srcX);
-                int readH = Mathf.Min(streamHeight, screenH - srcY);
 
-                _readbackTex.ReadPixels(new Rect(srcX, srcY, readW, readH), 0, 0, false);
+                // Capture at full Game View resolution (1:1, no downscale).
+                // The stream resolution always matches the Game View to avoid
+                // meaningless up/down-sampling.
+                int capW = screenW;
+                int capH = screenH;
+
+                // Lazy-allocate / resize reusable texture to the effective capture size.
+                if (_readbackTex == null ||
+                    _readbackTex.width  != capW ||
+                    _readbackTex.height != capH)
+                {
+                    if (_readbackTex != null) Destroy(_readbackTex);
+                    _readbackTex = new Texture2D(capW, capH, TextureFormat.RGB24, false);
+                }
+
+                // Capture the full screen rect (no letterbox offset needed since
+                // capW/capH always equal screenW/screenH).
+                _readbackTex.ReadPixels(new Rect(0, 0, capW, capH), 0, 0, false);
                 _readbackTex.Apply(false);
 
                 byte[] jpeg = _readbackTex.EncodeToJPG(jpegQuality);

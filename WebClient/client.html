@@ -119,22 +119,40 @@
             };
         }
 
+        function sendTouches(eventType, touches) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type: 'touch', eventType: eventType, touches }));
+        }
+
         function sendTouch(eventType, e) {
             e.preventDefault();
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
             const rect = canvas.getBoundingClientRect();
             const touches = Array.from(e.changedTouches).map(t => ({
                 id: t.identifier,
                 nx: (t.clientX - rect.left) / rect.width,
                 ny: (t.clientY - rect.top)  / rect.height,
             }));
-            ws.send(JSON.stringify({ type: 'touch', event: eventType, touches }));
+            sendTouches(eventType, touches);
+        }
+
+        // Mouse events — simulate single-finger touch for PC browser / DevTools
+        function sendMouse(eventType, e) {
+            const rect = canvas.getBoundingClientRect();
+            sendTouches(eventType, [{
+                id: 0,
+                nx: (e.clientX - rect.left) / rect.width,
+                ny: (e.clientY - rect.top)  / rect.height,
+            }]);
         }
 
         canvas.addEventListener('touchstart',  e => sendTouch('began',     e), { passive: false });
         canvas.addEventListener('touchmove',   e => sendTouch('moved',     e), { passive: false });
         canvas.addEventListener('touchend',    e => sendTouch('ended',     e), { passive: false });
         canvas.addEventListener('touchcancel', e => sendTouch('cancelled', e), { passive: false });
+
+        canvas.addEventListener('mousedown', e => sendMouse('began', e));
+        canvas.addEventListener('mousemove', e => { if (e.buttons & 1) sendMouse('moved', e); });
+        canvas.addEventListener('mouseup',   e => sendMouse('ended', e));
 
         document.getElementById('connect-btn').addEventListener('click', () => {
             const h = ipInput.value.trim();

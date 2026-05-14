@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.EnhancedTouch;
 using UnityEngine.InputSystem.LowLevel;
 
 namespace MobileBridge
@@ -10,40 +12,79 @@ namespace MobileBridge
     /// Subscribes to WebSocketServer.OnTouchMessage, parses JSON touch events,
     /// and injects them into Unity Input System via a virtual Touchscreen device.
     ///
-    /// NOTE: QueueStateEvent internally allocates Allocator.Temp, which is only
-    /// allowed on the main thread. WebSocket messages arrive on a thread-pool thread,
-    /// so we enqueue parsed data into a ConcurrentQueue and drain it on the main
-    /// thread via Tick(), called from MobileBridge.Update().
+    /// Design notes:
+    /// - EnhancedTouchSupport.Enable() is called once and never disabled, so it
+    ///   cannot interfere with user project code that also uses EnhancedTouch.
+    /// - QueueStateEvent requires Allocator.Temp (main thread only). WebSocket
+    ///   messages arrive on a thread-pool thread, so we enqueue raw normalised
+    ///   coordinates into a ConcurrentQueue and drain on the main thread via
+    ///   Tick(), called from MobileBridge.Update().
+    /// - Coordinate conversion (NormalizedToUnity) is intentionally deferred to
+    ///   Tick() so that Screen.width / Screen.height are only accessed from the
+    ///   main thread.
     /// </summary>
     public sealed class TouchReceiver
     {
         private readonly WebSocketServer _server;
         private Touchscreen _touchDevice;
+        private bool _deviceOwned;
 
         // Thread-safe queue: WS thread produces, main thread consumes.
         private readonly ConcurrentQueue<PendingTouch> _pending =
             new ConcurrentQueue<PendingTouch>();
+
+        // Main-thread-only: caches the screen-space start position per touchId
+        // so TouchState.startPosition is correct throughout a touch lifetime.
+        private readonly Dictionary<int, Vector2> _startPositions =
+            new Dictionary<int, Vector2>();
 
         public TouchReceiver(WebSocketServer server)
         {
             _server = server;
         }
 
+        // ── Lifecycle ──────────────────────────────────────────────────────────
+
         public void Start()
         {
-            _touchDevice = InputSystem.GetDevice<Touchscreen>()
-                           ?? InputSystem.AddDevice<Touchscreen>("MobileBridgeTouch");
+            // EnhancedTouchSupport.Enable() is idempotent — safe to call even if
+            // user code already called it. We intentionally never call Disable()
+            // to avoid inadvertently breaking user code that depends on it.
+            EnhancedTouchSupport.Enable();
+
+            // Add a named virtual device so it is clearly identifiable in the
+            // Input Debugger and never confused with a real hardware touchscreen.
+            _touchDevice = InputSystem.AddDevice<Touchscreen>("MobileBridgeTouch");
+            _deviceOwned = true;
+
             _server.OnTouchMessage += HandleMessage;
+
+            Debug.Log("[TouchReceiver] Started — virtual Touchscreen device added, EnhancedTouchSupport enabled.");
         }
 
         public void Stop()
         {
             _server.OnTouchMessage -= HandleMessage;
+
+            if (_deviceOwned && _touchDevice != null && _touchDevice.added)
+                InputSystem.RemoveDevice(_touchDevice);
+
+            _touchDevice = null;
+            _deviceOwned = false;
+            _startPositions.Clear();
+
+            // Drain any queued events that arrived between Stop() being called
+            // and the WS thread noticing the unsubscription.
+            while (_pending.TryDequeue(out _)) { }
+
+            Debug.Log("[TouchReceiver] Stopped — virtual Touchscreen device removed.");
         }
+
+        // ── Main-thread drain ──────────────────────────────────────────────────
 
         /// <summary>
         /// Must be called every frame from the main thread (MonoBehaviour.Update).
-        /// Drains the pending queue and calls QueueStateEvent on the main thread.
+        /// Converts normalised coordinates and injects TouchState events.
         /// </summary>
         public void Tick()
         {
@@ -51,37 +92,89 @@ namespace MobileBridge
 
             while (_pending.TryDequeue(out var t))
             {
+                Vector2 pos = CoordinateMapper.NormalizedToUnity(t.nx, t.ny);
+
+                // Maintain per-touch start position.
+                if (t.phase == UnityEngine.InputSystem.TouchPhase.Began)
+                {
+                    _startPositions[t.touchId] = pos;
+                }
+
+                _startPositions.TryGetValue(t.touchId, out Vector2 startPos);
+
+                if (t.phase == UnityEngine.InputSystem.TouchPhase.Ended ||
+                    t.phase == UnityEngine.InputSystem.TouchPhase.Canceled)
+                {
+                    _startPositions.Remove(t.touchId);
+                }
+
                 InputSystem.QueueStateEvent(_touchDevice, new TouchState
                 {
-                    touchId  = t.touchId,
-                    phase    = t.phase,
-                    position = t.position,
+                    touchId                = t.touchId,
+                    phase                  = t.phase,
+                    position               = pos,
+                    startPosition          = startPos,
+                    // The touch with the lowest id (1-based) is designated primary.
+                    // InputSystemUIInputModule and EnhancedTouch both rely on this
+                    // flag to drive pointer/drag events on UI elements.
+                    isPrimaryTouch         = (t.touchId == 1),
+                    isTap                  = false,
+                    tapCount               = 0,
+                    // A non-zero radius prevents some Input System versions from
+                    // silently discarding the event.
+                    radius                 = Vector2.one,
                 });
             }
         }
 
-        // Called on the WS thread-pool thread — must NOT call QueueStateEvent here.
+        // ── WS thread handler ──────────────────────────────────────────────────
+
+        // Called on the WS thread-pool thread — must NOT touch Unity APIs except
+        // ConcurrentQueue and Debug.Log (which is thread-safe).
         private void HandleMessage(string json)
         {
             TouchMessage msg;
-            try { msg = JsonUtility.FromJson<TouchMessage>(json); }
-            catch { return; }
+            try
+            {
+                msg = JsonUtility.FromJson<TouchMessage>(json);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[TouchReceiver] JSON parse error: {ex.Message}  raw={json}");
+                return;
+            }
 
-            if (msg.type != "touch" || msg.touches == null) return;
+            if (msg.type != "touch")
+            {
+                Debug.LogWarning($"[TouchReceiver] Unexpected message type: '{msg.type}'  raw={json}");
+                return;
+            }
 
-            UnityEngine.InputSystem.TouchPhase phase = ParsePhase(msg.@event);
+            if (msg.touches == null || msg.touches.Length == 0)
+            {
+                Debug.LogWarning($"[TouchReceiver] touches is null/empty. eventType='{msg.eventType}'  raw={json}");
+                return;
+            }
+
+            UnityEngine.InputSystem.TouchPhase phase = ParsePhase(msg.eventType);
+
+#if MOBILE_BRIDGE_DEBUG
+            Debug.Log($"[TouchReceiver] {msg.eventType} phase={phase} count={msg.touches.Length}");
+#endif
+
             foreach (var t in msg.touches)
             {
-                Vector2 pos = CoordinateMapper.NormalizedToUnity(t.nx, t.ny);
-
                 _pending.Enqueue(new PendingTouch
                 {
-                    touchId  = t.id + 1,   // Input System uses 1-based touch IDs
-                    phase    = phase,
-                    position = pos,
+                    touchId = t.id + 1,  // Input System uses 1-based touch IDs
+                    phase   = phase,
+                    nx      = t.nx,
+                    ny      = t.ny,
                 });
             }
         }
+
+        // ── Helpers ────────────────────────────────────────────────────────────
 
         private static UnityEngine.InputSystem.TouchPhase ParsePhase(string evt)
         {
@@ -99,16 +192,17 @@ namespace MobileBridge
 
         private struct PendingTouch
         {
-            public int                                  touchId;
-            public UnityEngine.InputSystem.TouchPhase   phase;
-            public Vector2                              position;
+            public int                                 touchId;
+            public UnityEngine.InputSystem.TouchPhase  phase;
+            public float                               nx;
+            public float                               ny;
         }
 
         [Serializable]
         private class TouchMessage
         {
             public string       type;
-            public string       @event;
+            public string       eventType;   // matches client.html JSON field "eventType"
             public TouchPoint[] touches;
         }
 

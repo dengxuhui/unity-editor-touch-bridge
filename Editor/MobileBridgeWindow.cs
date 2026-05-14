@@ -28,11 +28,10 @@ namespace MobileBridge.Editor
         // Settings (mirrored to/from MobileBridge component)
         private int   _targetFps    = 30;
         private int   _jpegQuality  = 75;
-        private int   _streamWidthIndex  = 1;   // default 960×540, height via ResHeights[index]
 
-        private static readonly string[] ResLabels = { "640×360", "960×540", "1280×720" };
-        private static readonly int[] ResWidths    = { 640, 960, 1280 };
-        private static readonly int[] ResHeights   = { 360, 540, 720  };
+        // Game View resolution (read-only, auto-detected via reflection)
+        private int   _gameViewWidth  = 0;
+        private int   _gameViewHeight = 0;
 
         // ── EditorWindow lifecycle ─────────────────────────────────────────────
 
@@ -108,8 +107,13 @@ namespace MobileBridge.Editor
             EditorGUILayout.LabelField("Stream Settings", EditorStyles.boldLabel);
             using var indent = new EditorGUI.IndentLevelScope(1);
 
-            _streamWidthIndex = EditorGUILayout.Popup("Resolution",
-                _streamWidthIndex, ResLabels);
+            // Resolution: auto-follow Game View (read-only display)
+            RefreshGameViewSize();
+            string resLabel = (_gameViewWidth > 0 && _gameViewHeight > 0)
+                ? $"{_gameViewWidth} × {_gameViewHeight}  (Game View)"
+                : "Unknown (enter Play Mode)";
+            using (new EditorGUI.DisabledScope(true))
+                EditorGUILayout.TextField("Resolution", resLabel);
 
             _targetFps   = EditorGUILayout.IntSlider("Target FPS", _targetFps, 1, 60);
             _jpegQuality = EditorGUILayout.IntSlider("JPEG Quality", _jpegQuality, 1, 100);
@@ -118,8 +122,58 @@ namespace MobileBridge.Editor
             {
                 _bridge.targetFps   = _targetFps;
                 _bridge.jpegQuality = _jpegQuality;
-                _bridge.streamWidth  = ResWidths[_streamWidthIndex];
-                _bridge.streamHeight = ResHeights[_streamWidthIndex];
+                // streamWidth/streamHeight are driven by Screen.width/height at runtime;
+                // no need to push them here.
+            }
+        }
+
+        /// <summary>
+        /// Reads the current Game View size via reflection (internal Unity API).
+        /// Falls back to 0×0 if unavailable.
+        /// </summary>
+        private void RefreshGameViewSize()
+        {
+            try
+            {
+                var gameViewType = typeof(UnityEditor.EditorWindow).Assembly
+                    .GetType("UnityEditor.GameView");
+                if (gameViewType == null) return;
+
+                var gameView = EditorWindow.GetWindow(gameViewType, false, null, false);
+                if (gameView == null) return;
+
+                // Unity 2022+: targetSize property returns the current Game View pixel size
+                var targetSizeProp = gameViewType.GetProperty(
+                    "targetSize",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (targetSizeProp != null)
+                {
+                    var size = (Vector2)targetSizeProp.GetValue(gameView);
+                    _gameViewWidth  = Mathf.RoundToInt(size.x);
+                    _gameViewHeight = Mathf.RoundToInt(size.y);
+                    return;
+                }
+
+                // Fallback: currentGameViewSize (older Unity versions)
+                var sizeProp = gameViewType.GetProperty(
+                    "currentGameViewSize",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (sizeProp != null)
+                {
+                    var gvSize = sizeProp.GetValue(gameView);
+                    var gvSizeType = gvSize.GetType();
+                    var wProp = gvSizeType.GetProperty("width");
+                    var hProp = gvSizeType.GetProperty("height");
+                    if (wProp != null && hProp != null)
+                    {
+                        _gameViewWidth  = Mathf.RoundToInt((float)wProp.GetValue(gvSize));
+                        _gameViewHeight = Mathf.RoundToInt((float)hProp.GetValue(gvSize));
+                    }
+                }
+            }
+            catch
+            {
+                // Non-critical; silently ignore reflection failures
             }
         }
 
@@ -181,8 +235,8 @@ namespace MobileBridge.Editor
             if (_bridge == null) return;
             _bridge.targetFps    = _targetFps;
             _bridge.jpegQuality  = _jpegQuality;
-            _bridge.streamWidth  = ResWidths[_streamWidthIndex];
-            _bridge.streamHeight = ResHeights[_streamWidthIndex];
+            // streamWidth/streamHeight no longer set here;
+            // CaptureLoop uses Screen.width/height (Game View size) directly.
             _bridge.StartBridge();
             _isRunning = true;
         }
