@@ -122,9 +122,20 @@ namespace MobileBridge.Editor
             {
                 _bridge.targetFps   = _targetFps;
                 _bridge.jpegQuality = _jpegQuality;
-                // streamWidth/streamHeight are driven by Screen.width/height at runtime;
-                // no need to push them here.
             }
+
+            GUILayout.Space(4);
+            EditorGUILayout.LabelField("Debug", EditorStyles.boldLabel);
+            using var indent2 = new EditorGUI.IndentLevelScope(1);
+
+            bool consoleLogging = BridgeLogger.ConsoleLoggingEnabled;
+            bool newConsoleLogging = EditorGUILayout.Toggle(
+                new GUIContent("Console Logging",
+                    "Print MobileBridge Runtime logs to the Unity Console.\n" +
+                    "Enable during development; disable when distributing to keep the Console clean."),
+                consoleLogging);
+            if (newConsoleLogging != consoleLogging)
+                BridgeLogger.ConsoleLoggingEnabled = newConsoleLogging;
         }
 
         /// <summary>

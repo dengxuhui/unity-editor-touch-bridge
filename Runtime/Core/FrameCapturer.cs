@@ -9,31 +9,44 @@ namespace MobileBridge
     /// Receives JPEG-encoded frames from the main thread and sends them
     /// to all WebSocket clients via a dedicated background send thread.
     ///
-    /// Pipeline (current implementation):
+    /// Pipeline:
     ///   ① MobileBridge.CaptureLoop (main thread, WaitForEndOfFrame)
-    ///        → ReadPixels (sync GPU readback, ~1–3 ms at stream resolution)
-    ///        → EncodeToJPG
+    ///        → ReadPixels + EncodeToJPG
     ///        → EnqueueJpeg
     ///   ② This class (background thread) → WebSocket broadcast
-    ///
-    /// WaitForEndOfFrame is used instead of AsyncGPUReadback so that
-    /// Screen Space Overlay canvases are included in the captured frame.
-    /// AsyncGPUReadback fires inside the URP render pass, before Overlay UI
-    /// is composited, which caused 2D UI to be invisible in the stream.
-    ///
-    /// Trade-off: ReadPixels + EncodeToJPG run on the main thread (~3–8 ms).
-    /// For a P3 optimisation, encoding could be moved to a worker thread using
-    /// a pure-C# JPEG encoder or a native plugin.
     /// </summary>
     public sealed class FrameCapturer
     {
         private readonly WebSocketServer _server;
 
-        // Capacity 2: if the send thread falls behind, drop new frames rather than accumulate.
+        // Capacity 2: if the send thread falls behind, drop new frames.
         private readonly BlockingCollection<byte[]> _queue = new BlockingCollection<byte[]>(2);
 
         private Thread _sendThread;
         private volatile bool _running;
+
+        // ── Diagnostic counters (written by multiple threads, read for logging) ─
+        // All accessed via Interlocked for thread safety.
+        private long _totalEnqueued;
+        private long _totalDropped;       // TryAdd returned false (queue full)
+        private long _totalSendOk;
+        private long _totalSendErr;
+        private long _totalSendSlowMs;    // accumulated slow-send ms (>300ms)
+        private long _slowSendCount;
+
+        // Timestamps (Environment.TickCount, ms) — written by send thread only.
+        // Using int cast to long to avoid sign issues over long sessions.
+        private long _lastDequeueMs;
+        private long _lastSendOkMs;
+
+        // Per-second snapshot (refreshed in SendLoop on send thread)
+        private long _statsWindowEnqueued;
+        private long _statsWindowSendOk;
+        private long _statsWindowDrop;
+        private long _statsLastPrintMs;
+
+        // Stall detection: if clients are connected and nothing is sent for this long, warn.
+        private const long StallThresholdMs = 2000;
 
         public FrameCapturer(WebSocketServer server)
         {
@@ -43,6 +56,11 @@ namespace MobileBridge
         public void Start()
         {
             _running = true;
+            long now = (long)Environment.TickCount;
+            _lastSendOkMs     = now;
+            _lastDequeueMs    = now;
+            _statsLastPrintMs = now;
+
             _sendThread = new Thread(SendLoop)
             {
                 IsBackground = true,
@@ -56,6 +74,12 @@ namespace MobileBridge
             _running = false;
             _queue.CompleteAdding();
             _sendThread?.Join(2000);
+
+            // Final summary
+            MobileBridge.MBLog($"[MB][FrameCapturer] Session summary — " +
+                      $"enqueued={_totalEnqueued} sendOk={_totalSendOk} " +
+                      $"dropped={_totalDropped} sendErr={_totalSendErr} " +
+                      $"slowSends={_slowSendCount} slowTotalMs={_totalSendSlowMs}");
         }
 
         /// <summary>
@@ -65,7 +89,20 @@ namespace MobileBridge
         public void EnqueueJpeg(byte[] jpegBytes)
         {
             if (!_running || jpegBytes == null || jpegBytes.Length == 0) return;
-            _queue.TryAdd(jpegBytes);   // silently drops if queue is full (back-pressure)
+
+            if (_queue.TryAdd(jpegBytes))
+            {
+                Interlocked.Increment(ref _totalEnqueued);
+                Interlocked.Increment(ref _statsWindowEnqueued);
+            }
+            else
+            {
+                Interlocked.Increment(ref _totalDropped);
+                Interlocked.Increment(ref _statsWindowDrop);
+#if MOBILE_BRIDGE_DEBUG
+                MobileBridge.MBLogWarning("[MB][FrameCapturer] WARN queue_full — frame dropped (send thread lagging)");
+#endif
+            }
         }
 
         private void SendLoop()
@@ -73,17 +110,83 @@ namespace MobileBridge
             while (_running)
             {
                 byte[] jpeg;
-                try { jpeg = _queue.Take(); }
-                catch (InvalidOperationException) { break; }
+                try
+                {
+                    jpeg = _queue.Take();
+                }
+                catch (InvalidOperationException)
+                {
+                    break; // CompleteAdding() called
+                }
 
+                _lastDequeueMs = (long)Environment.TickCount;
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
                     _server.BroadcastFrameAsync(jpeg).GetAwaiter().GetResult();
+                    sw.Stop();
+
+                    long elapsedMs = sw.ElapsedMilliseconds;
+                    _lastSendOkMs = (long)Environment.TickCount;
+                    Interlocked.Increment(ref _totalSendOk);
+                    Interlocked.Increment(ref _statsWindowSendOk);
+
+                    if (elapsedMs > 300)
+                    {
+                        Interlocked.Increment(ref _slowSendCount);
+                        Interlocked.Add(ref _totalSendSlowMs, elapsedMs);
+                        MobileBridge.MBLogWarning(
+                            $"[MB][FrameCapturer] WARN broadcast_slow — took {elapsedMs}ms " +
+                            $"(clients={_server.ClientCount})");
+                    }
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogWarning($"[MobileBridge] Frame send error: {ex.Message}");
+                    sw.Stop();
+                    Interlocked.Increment(ref _totalSendErr);
+                    MobileBridge.MBLogWarning(
+                        $"[MB][FrameCapturer] WARN send_error — {ex.GetType().Name}: {ex.Message}");
                 }
+
+                // Print per-second stats + stall check
+                PrintStatsIfDue();
+            }
+
+            MobileBridge.MBLog("[MB][FrameCapturer] Send thread exited.");        }
+
+        private void PrintStatsIfDue()
+        {
+            long now = (long)Environment.TickCount;
+            if (now - _statsLastPrintMs < 1000) return;
+
+            long windowMs    = now - _statsLastPrintMs;
+            long enq         = Interlocked.Exchange(ref _statsWindowEnqueued, 0);
+            long sent        = Interlocked.Exchange(ref _statsWindowSendOk,   0);
+            long drop        = Interlocked.Exchange(ref _statsWindowDrop,     0);
+            int  clients     = _server.ClientCount;
+            long queueLen    = _queue.Count;
+            long msSinceOk   = now - _lastSendOkMs;
+
+            _statsLastPrintMs = now;
+
+            // enqFps / sentFps approximate (based on window)
+            float enqFps  = enq  * 1000f / windowMs;
+            float sentFps = sent * 1000f / windowMs;
+
+            MobileBridge.MBLog(
+                $"[MB][FrameCapturer] STATS " +
+                $"enqFps={enqFps:F1} sentFps={sentFps:F1} " +
+                $"drop1s={drop} queueLen={queueLen} " +
+                $"clients={clients} msSinceLastSendOk={msSinceOk} " +
+                $"totalSent={_totalSendOk} totalDrop={_totalDropped} totalErr={_totalSendErr}");
+
+            // Stall detection: clients connected but nothing sent for a while
+            if (clients > 0 && msSinceOk > StallThresholdMs)
+            {
+                MobileBridge.MBLogWarning(
+                    $"[MB][FrameCapturer] WARN send_stalled — " +
+                    $"{msSinceOk}ms since last successful send, clients={clients}");
             }
         }
     }

@@ -59,7 +59,7 @@ namespace MobileBridge
 
             _server.OnTouchMessage += HandleMessage;
 
-            Debug.Log("[TouchReceiver] Started — virtual Touchscreen device added, EnhancedTouchSupport enabled.");
+            MobileBridge.MBLog("[TouchReceiver] Started — virtual Touchscreen device added, EnhancedTouchSupport enabled.");
         }
 
         public void Stop()
@@ -77,7 +77,7 @@ namespace MobileBridge
             // and the WS thread noticing the unsubscription.
             while (_pending.TryDequeue(out _)) { }
 
-            Debug.Log("[TouchReceiver] Stopped — virtual Touchscreen device removed.");
+            MobileBridge.MBLog("[TouchReceiver] Stopped — virtual Touchscreen device removed.");
         }
 
         // ── Main-thread drain ──────────────────────────────────────────────────
@@ -140,26 +140,26 @@ namespace MobileBridge
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[TouchReceiver] JSON parse error: {ex.Message}  raw={json}");
+                MobileBridge.MBLogWarning($"[TouchReceiver] JSON parse error: {ex.Message}  raw={json}");
                 return;
             }
 
             if (msg.type != "touch")
             {
-                Debug.LogWarning($"[TouchReceiver] Unexpected message type: '{msg.type}'  raw={json}");
+                MobileBridge.MBLogWarning($"[TouchReceiver] Unexpected message type: '{msg.type}'  raw={json}");
                 return;
             }
 
             if (msg.touches == null || msg.touches.Length == 0)
             {
-                Debug.LogWarning($"[TouchReceiver] touches is null/empty. eventType='{msg.eventType}'  raw={json}");
+                MobileBridge.MBLogWarning($"[TouchReceiver] touches is null/empty. eventType='{msg.eventType}'  raw={json}");
                 return;
             }
 
             UnityEngine.InputSystem.TouchPhase phase = ParsePhase(msg.eventType);
 
 #if MOBILE_BRIDGE_DEBUG
-            Debug.Log($"[TouchReceiver] {msg.eventType} phase={phase} count={msg.touches.Length}");
+            MobileBridge.MBLog($"[TouchReceiver] {msg.eventType} phase={phase} count={msg.touches.Length}");
 #endif
 
             foreach (var t in msg.touches)

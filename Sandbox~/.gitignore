@@ -118,3 +118,4 @@ InitTestScene*.unity*
 
 .idea/
 *.sln.iml
+.DS_Store

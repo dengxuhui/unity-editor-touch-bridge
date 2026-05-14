@@ -11,9 +11,11 @@
         #status {
             position: fixed; top: 8px; left: 8px;
             background: rgba(0,0,0,0.6); color: #fff;
-            font-family: monospace; font-size: 13px;
+            font-family: monospace; font-size: 12px;
             padding: 4px 8px; border-radius: 4px;
             pointer-events: none; z-index: 10;
+            line-height: 1.6;
+            white-space: pre;
         }
         #ip-form {
             position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
@@ -45,19 +47,85 @@
 
     <script>
     (function () {
-        const canvas = document.getElementById('canvas');
-        const ctx    = canvas.getContext('2d');
-        const status = document.getElementById('status');
-        const ipForm = document.getElementById('ip-form');
-        const ipInput = document.getElementById('ip-input');
+        const canvas   = document.getElementById('canvas');
+        const ctx      = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const ipForm   = document.getElementById('ip-form');
+        const ipInput  = document.getElementById('ip-input');
 
-        let ws = null;
+        let ws             = null;
         let reconnectTimer = null;
-        let frameCount = 0;
-        let lastFpsTime = Date.now();
-        let fps = 0;
-        let everConnected = false;
+        let showDebug      = false;  // hidden until server sends cfg
 
+        // ── Diagnostics ──────────────────────────────────────────────────────
+        let rxFrameCount   = 0;
+        let drawFrameCount = 0;
+        let rxFps          = 0;
+        let drawFps        = 0;
+        let lastFpsTime    = Date.now();
+        let lastFrameTs    = 0;   // timestamp of last video frame received
+        let lastHbTs       = 0;   // timestamp of last heartbeat received
+        let reconnectCount = 0;
+        let decodeErrCount = 0;
+        let totalRxFrames  = 0;
+        let frameStallLogged = false;
+
+        // Thresholds
+        const STALL_WARN_MS    = 1500;  // warn in status bar
+        const STALL_RECONN_MS  = 3000;  // force ws.close() → auto-reconnect
+
+        function updateStatus(connected) {
+            if (!showDebug) { statusEl.style.display = 'none'; return; }
+            statusEl.style.display = 'block';
+            const now   = Date.now();
+            const ageMs = (connected && lastFrameTs > 0) ? now - lastFrameTs : -1;
+            const hbAgeMs = (connected && lastHbTs > 0) ? now - lastHbTs : -1;
+            const stall = (ageMs > STALL_WARN_MS) ? ' STALL' : '';
+            const wsState = ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'NULL';
+            statusEl.textContent =
+                (connected ? '● ' : '○ ') +
+                (connected ? `rx ${rxFps} fps  draw ${drawFps} fps` : 'Disconnected') +
+                `\nage ${ageMs >= 0 ? ageMs + 'ms' : '--'}${stall}  hb ${hbAgeMs >= 0 ? hbAgeMs + 'ms' : '--'}` +
+                `\ntotalRx ${totalRxFrames}  reconn ${reconnectCount}  decErr ${decodeErrCount}` +
+                `\nws ${wsState}`;
+        }
+
+        // ── Per-second watchdog ───────────────────────────────────────────────
+        setInterval(() => {
+            const now = Date.now();
+            const dt  = now - lastFpsTime;
+            rxFps     = Math.round(rxFrameCount   * 1000 / dt);
+            drawFps   = Math.round(drawFrameCount * 1000 / dt);
+            rxFrameCount   = 0;
+            drawFrameCount = 0;
+            lastFpsTime    = now;
+
+            const connected = ws && ws.readyState === WebSocket.OPEN;
+            updateStatus(connected);
+
+            if (connected && lastFrameTs > 0) {
+                const ageMs = now - lastFrameTs;
+
+                // Warn in console once
+                if (ageMs > STALL_WARN_MS && !frameStallLogged) {
+                    console.warn(`[MB][client] frame_stall ageMs=${ageMs} totalRx=${totalRxFrames} wsState=OPEN`);
+                    frameStallLogged = true;
+                }
+                if (ageMs <= STALL_WARN_MS) {
+                    frameStallLogged = false;
+                }
+
+                // Force reconnect — ws is alive (heartbeat recent) but video frames stopped
+                if (ageMs > STALL_RECONN_MS) {
+                    const hbAge = lastHbTs > 0 ? now - lastHbTs : -1;
+                    console.warn(`[MB][client] stall_reconnect ageMs=${ageMs} hbAge=${hbAge} totalRx=${totalRxFrames}`);
+                    // Close triggers onclose → automatic reconnect
+                    ws.close(4001, 'stall_reconnect');
+                }
+            }
+        }, 1000);
+
+        // ── Canvas resize ────────────────────────────────────────────────────
         function resizeCanvas() {
             canvas.width  = window.innerWidth;
             canvas.height = window.innerHeight;
@@ -65,6 +133,7 @@
         window.addEventListener('resize', resizeCanvas);
         resizeCanvas();
 
+        // ── Connection management ────────────────────────────────────────────
         function savedHost() {
             return localStorage.getItem('bridge_host') || null;
         }
@@ -79,46 +148,123 @@
         function openWs(host) {
             if (ws) { ws.onclose = null; ws.close(); ws = null; }
             clearTimeout(reconnectTimer);
-            everConnected = false;
+            lastFrameTs      = 0;
+            lastHbTs         = 0;
+            frameStallLogged = false;
 
-            const protocol = 'ws:';
-            status.textContent = 'Connecting…';
-            ws = new WebSocket(`${protocol}//${host}:8765`);
+            // Drain any pending decode so stale bitmap never draws after reconnect
+            pendingBlob = null;
+
+            statusEl.textContent = 'Connecting…';
+            ws = new WebSocket(`ws://${host}:8765`);
             ws.binaryType = 'arraybuffer';
 
+            const openTs = Date.now();
+
             ws.onopen = () => {
-                everConnected = true;
-                status.textContent = 'Connected  0 fps';
-                frameCount = 0;
-                lastFpsTime = Date.now();
+                reconnectCount++;
+                console.log(`[MB][client] ws_open host=${host} reconnectCount=${reconnectCount} handshakeMs=${Date.now()-openTs}`);
+                lastFrameTs = Date.now();
+                lastHbTs    = Date.now();
+                updateStatus(true);
+                // Send hello so server can reply with directed cfg immediately
+                ws.send(JSON.stringify({ type: 'hello' }));
+                console.log('[MB][client] hello_sent');
             };
 
-            ws.onclose = () => {
-                status.textContent = 'Disconnected — retrying…';
+            ws.onclose = (e) => {
+                console.warn(`[MB][client] ws_close code=${e.code} reason="${e.reason}" wasClean=${e.wasClean} totalRx=${totalRxFrames}`);
+                updateStatus(false);
                 reconnectTimer = setTimeout(() => openWs(host), 2000);
             };
 
             ws.onerror = () => {
-                status.textContent = 'Connection error';
+                console.error(`[MB][client] ws_error totalRx=${totalRxFrames}`);
+                updateStatus(false);
             };
 
-            ws.onmessage = async (e) => {
-                const bitmap = await createImageBitmap(new Blob([e.data], { type: 'image/jpeg' }));
+            ws.onmessage = onMessage;
+        }
+
+        // ── Latest-frame-only decode pipeline ────────────────────────────────
+        //
+        // Problem: mobile browsers can queue many onmessage callbacks. If
+        // createImageBitmap() takes longer than the inter-frame interval the
+        // decode queue grows unboundedly, causing the rendered image to lag
+        // further and further behind real-time (appears as "frame stall even
+        // though ws.readyState===OPEN").
+        //
+        // Fix: keep only the newest blob. If a decode is already in-flight,
+        // replace pendingBlob; when the in-flight decode finishes it draws
+        // immediately and then starts decoding pendingBlob (if any) — always
+        // showing the most recent frame, never accumulating a backlog.
+
+        let pendingBlob  = null;   // newest unprocessed blob (may be replaced)
+        let decoding     = false;  // true while createImageBitmap is in-flight
+
+        function onMessage(e) {
+            const recvTs = Date.now();
+            rxFrameCount++;
+            totalRxFrames++;
+
+            // Text message: heartbeat or other JSON
+            if (typeof e.data === 'string') {
+                try {
+                    const msg = JSON.parse(e.data);
+                    if (msg.type === 'hb') {
+                        lastHbTs = recvTs;
+                    } else if (msg.type === 'cfg' && typeof msg.showDebug === 'boolean') {
+                        console.log(`[MB][client] cfg_recv showDebug=${msg.showDebug}`);
+                        showDebug = msg.showDebug;
+                        updateStatus(ws && ws.readyState === WebSocket.OPEN);
+                    }
+                } catch (_) {}
+                return;
+            }
+
+            // Binary message: JPEG frame
+            lastFrameTs = recvTs;
+            const blob  = new Blob([e.data], { type: 'image/jpeg' });
+
+            if (decoding) {
+                // Drop the previous pending frame, keep only the newest
+                pendingBlob = blob;
+                return;
+            }
+
+            decodeAndDraw(blob);
+        }
+
+        function decodeAndDraw(blob) {
+            decoding = true;
+            createImageBitmap(blob).then(bitmap => {
                 requestAnimationFrame(() => {
                     ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
                     bitmap.close();
+                    drawFrameCount++;
                 });
-                frameCount++;
-                const now = Date.now();
-                if (now - lastFpsTime >= 1000) {
-                    fps = Math.round(frameCount * 1000 / (now - lastFpsTime));
-                    frameCount = 0;
-                    lastFpsTime = now;
-                    status.textContent = `Connected  ${fps} fps`;
+
+                // Process the next pending frame immediately (if any)
+                decoding = false;
+                if (pendingBlob !== null) {
+                    const next = pendingBlob;
+                    pendingBlob = null;
+                    decodeAndDraw(next);
                 }
-            };
+            }).catch(err => {
+                decoding = false;
+                decodeErrCount++;
+                console.error(`[MB][client] decode_error #${decodeErrCount} totalRx=${totalRxFrames} err=${err.message}`);
+                // Still try pending blob so pipeline doesn't permanently stall
+                if (pendingBlob !== null) {
+                    const next = pendingBlob;
+                    pendingBlob = null;
+                    decodeAndDraw(next);
+                }
+            });
         }
 
+        // ── Touch / Mouse input ──────────────────────────────────────────────
         function sendTouches(eventType, touches) {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             ws.send(JSON.stringify({ type: 'touch', eventType: eventType, touches }));
@@ -135,7 +281,6 @@
             sendTouches(eventType, touches);
         }
 
-        // Mouse events — simulate single-finger touch for PC browser / DevTools
         function sendMouse(eventType, e) {
             const rect = canvas.getBoundingClientRect();
             sendTouches(eventType, [{
@@ -162,7 +307,7 @@
             if (e.key === 'Enter') { const h = ipInput.value.trim(); if (h) startConnect(h); }
         });
 
-        // Auto-connect: use page hostname if not localhost, else check localStorage
+        // Auto-connect
         const autoHost = (location.hostname && location.hostname !== 'localhost')
             ? location.hostname
             : savedHost();

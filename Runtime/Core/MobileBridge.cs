@@ -14,6 +14,24 @@ namespace MobileBridge
     [DefaultExecutionOrder(-1000)]
     public sealed class MobileBridge : MonoBehaviour
     {
+        // ── Editor injection point ─────────────────────────────────────────────
+#if UNITY_EDITOR
+        /// <summary>
+        /// Injected by the Editor assembly ([InitializeOnLoad]) to provide the
+        /// current "show client debug overlay" preference without Runtime → Editor
+        /// assembly dependency.
+        /// </summary>
+        public static System.Func<bool> ClientDebugOverlayProvider;
+
+        /// <summary>
+        /// Injected by the Editor assembly ([InitializeOnLoad]) to indicate whether
+        /// MobileBridge logs should be printed to the Unity Console. When null or
+        /// returning true, all Debug.Log calls are active (default for development).
+        /// Set to a provider returning false to suppress console output.
+        /// </summary>
+        public static System.Func<bool> ConsoleLoggingProvider;
+#endif
+
         // ── Public API ─────────────────────────────────────────────────────────
 
         public static MobileBridge Instance { get; private set; }
@@ -36,16 +54,28 @@ namespace MobileBridge
         private FrameCapturer   _capturer;
         private TouchReceiver   _receiver;
 
-        // Reusable texture for ReadPixels — avoid per-frame alloc
+        // Reusable texture for ReadPixels
         private Texture2D _readbackTex;
         private float     _lastCaptureTime;
+
+        // ── Capture diagnostics ────────────────────────────────────────────────
+        // Counters reset each second for per-second stats logging.
+        private int   _captureCountThisSecond;
+        private int   _captureSkipNoClientThisSecond;
+        private int   _captureSkipThrottleThisSecond;
+        private float _lastStatsTime;
+        private long  _totalCaptureBytes;
+        private int   _totalCaptureFrames;
+
+        // Stall detection: clients connected but nothing enqueued
+        private const float CaptureStallThresholdSec = 2f;
+        private float _lastEnqueueTime = -1f;
 
         private static string ClientHtmlPath
         {
             get
             {
 #if UNITY_EDITOR
-                // Resolve relative to the package root via the project's Packages folder
                 string packageRoot = Path.GetFullPath(
                     "Packages/com.dengxuhui.unity-editor-touch-bridge");
                 return Path.Combine(packageRoot, "WebClient", "client.html");
@@ -81,11 +111,29 @@ namespace MobileBridge
 
         // ── Bridge control ─────────────────────────────────────────────────────
 
+        /// <summary>Emit a log line only when console logging is enabled.</summary>
+        internal static void MBLog(string msg)
+        {
+#if UNITY_EDITOR
+            if (ConsoleLoggingProvider != null && !ConsoleLoggingProvider()) return;
+#endif
+            Debug.Log(msg);
+        }
+
+        /// <summary>Emit a warning line only when console logging is enabled.</summary>
+        internal static void MBLogWarning(string msg)
+        {
+#if UNITY_EDITOR
+            if (ConsoleLoggingProvider != null && !ConsoleLoggingProvider()) return;
+#endif
+            Debug.LogWarning(msg);
+        }
+
         public void StartBridge()
         {
             if (IsActive)
             {
-                Debug.LogWarning("[MobileBridge] Already running.");
+                MBLogWarning("[MB][MobileBridge] Already running.");
                 return;
             }
 
@@ -97,18 +145,40 @@ namespace MobileBridge
             _capturer.Start();
             _receiver.Start();
 
+#if UNITY_EDITOR
+            // Primary path: client sends hello → server replies with directed cfg.
+            // This is reliable because the session is already registered when hello arrives.
+            _server.OnHelloReceived += sessionId =>
+            {
+                bool show = ClientDebugOverlayProvider?.Invoke() ?? false;
+                string cfg = $"{{\"type\":\"cfg\",\"showDebug\":{(show ? "true" : "false")}}}";
+                MBLog($"[MB][MobileBridge] hello_recv id={sessionId} → sending cfg showDebug={show}");
+                _server.SendText(sessionId, cfg);
+            };
+            // Fallback path: directed send on connect (session is registered at this point in
+            // websocket-sharp, but we use SendTo rather than Broadcast to avoid timing issues).
+            _server.OnClientConnected += sessionId =>
+            {
+                bool show = ClientDebugOverlayProvider?.Invoke() ?? false;
+                string cfg = $"{{\"type\":\"cfg\",\"showDebug\":{(show ? "true" : "false")}}}";
+                MBLog($"[MB][MobileBridge] client_connected id={sessionId} → sending cfg showDebug={show}");
+                _server.SendText(sessionId, cfg);
+            };
+#endif
+
             IsActive = true;
+            _lastStatsTime  = Time.realtimeSinceStartup;
+            _lastEnqueueTime = Time.realtimeSinceStartup;
             StartCoroutine(CaptureLoop());
 
-            Debug.Log($"[MobileBridge] Started — WS:{WebSocketServer.WsPort}  HTTP:{WebSocketServer.HttpPort}");
+            MBLog($"[MB][MobileBridge] Started — WS:{WebSocketServer.WsPort}  HTTP:{WebSocketServer.HttpPort} " +
+                      $"targetFps={targetFps} jpegQuality={jpegQuality}");
         }
 
         public void StopBridge()
         {
             if (!IsActive) return;
             IsActive = false;
-
-            // CaptureLoop coroutine checks IsActive and will exit on its own.
 
             _receiver?.Stop();
             _capturer?.Stop();
@@ -119,98 +189,133 @@ namespace MobileBridge
             _capturer = null;
             _server   = null;
 
-            Debug.Log("[MobileBridge] Stopped.");
+            MBLog($"[MB][MobileBridge] Stopped. totalFrames={_totalCaptureFrames} " +
+                       $"totalBytes={_totalCaptureBytes}");
+        }
+
+        /// <summary>
+        /// Broadcast a config message to all connected clients.
+        /// Called by the Editor menu to push settings (e.g. show/hide debug overlay)
+        /// without requiring a reconnect.
+        /// </summary>
+        public void BroadcastConfigMessage(bool showDebug)
+        {
+            MBLog($"[MB][MobileBridge] BroadcastConfigMessage showDebug={showDebug} clients={ClientCount}");
+            _server?.BroadcastText($"{{\"type\":\"cfg\",\"showDebug\":{(showDebug ? "true" : "false")}}}");
         }
 
         // ── MonoBehaviour update ───────────────────────────────────────────────
 
         private void Update()
         {
-            // Drain touch events queued by the WS thread onto the main thread,
-            // where QueueStateEvent (Allocator.Temp) is permitted.
             _receiver?.Tick();
         }
 
         // ── Frame capture loop ─────────────────────────────────────────────────
 
-        /// <summary>
-        /// Coroutine that captures the complete screen (including Canvas Overlay)
-        /// every frame after Unity has finished compositing everything — including
-        /// Screen Space Overlay canvases — into the final backbuffer.
-        ///
-        /// WaitForEndOfFrame is the only point where ReadPixels can see Overlay UI.
-        /// AsyncGPUReadback from a ScriptableRenderPass fires before Overlay is drawn,
-        /// which is why this approach is required.
-        ///
-        /// Trade-off: ReadPixels is a synchronous GPU stall (~1-3 ms at stream
-        /// resolution). For an Editor-only debug tool this is acceptable.
-        /// </summary>
         private IEnumerator CaptureLoop()
         {
-            var waitEof = new WaitForEndOfFrame();
+            var waitEof  = new WaitForEndOfFrame();
             float interval = 1f / Mathf.Max(targetFps, 1);
 
             while (IsActive)
             {
-                // Skip capture entirely when no client is connected — avoids
-                // wasting CPU/GPU on ReadPixels + JPEG encode with nobody to receive.
-                if (ClientCount == 0)
+                int clients = ClientCount;
+
+                if (clients == 0)
                 {
+                    _captureSkipNoClientThisSecond++;
+                    PrintStatsIfDue();
                     yield return null;
                     continue;
                 }
 
-                // Throttle to targetFps
                 float now = Time.realtimeSinceStartup;
                 if (now - _lastCaptureTime < interval)
                 {
+                    _captureSkipThrottleThisSecond++;
+                    PrintStatsIfDue();
                     yield return null;
                     continue;
                 }
 
-                yield return waitEof;   // ← all rendering including Overlay is done here
+                // Stall detection: clients connected but we haven't enqueued for a while
+                if (_lastEnqueueTime >= 0 &&
+                    now - _lastEnqueueTime > CaptureStallThresholdSec)
+                {
+                    MBLogWarning(
+                        $"[MB][MobileBridge] WARN capture_stall — " +
+                        $"{(now - _lastEnqueueTime) * 1000f:F0}ms since last enqueue, clients={clients}");
+                    // Reset to avoid spam every frame
+                    _lastEnqueueTime = now;
+                }
+
+                yield return waitEof;
 
                 if (!IsActive) yield break;
 
-                // Update interval in case targetFps changed at runtime
                 interval = 1f / Mathf.Max(targetFps, 1);
                 _lastCaptureTime = Time.realtimeSinceStartup;
 
                 int screenW = Screen.width;
                 int screenH = Screen.height;
 
-                // Capture at full Game View resolution (1:1, no downscale).
-                // The stream resolution always matches the Game View to avoid
-                // meaningless up/down-sampling.
-                int capW = screenW;
-                int capH = screenH;
-
-                // Lazy-allocate / resize reusable texture to the effective capture size.
                 if (_readbackTex == null ||
-                    _readbackTex.width  != capW ||
-                    _readbackTex.height != capH)
+                    _readbackTex.width  != screenW ||
+                    _readbackTex.height != screenH)
                 {
-                    if (_readbackTex != null) Destroy(_readbackTex);
-                    _readbackTex = new Texture2D(capW, capH, TextureFormat.RGB24, false);
+                    if (_readbackTex != null)
+                    {
+                        MBLog($"[MB][MobileBridge] Texture resized {_readbackTex.width}x{_readbackTex.height} → {screenW}x{screenH}");
+                        Destroy(_readbackTex);
+                    }
+                    _readbackTex = new Texture2D(screenW, screenH, TextureFormat.RGB24, false);
+                    MBLog($"[MB][MobileBridge] Readback texture created {screenW}x{screenH}");
                 }
 
-                // Capture the full screen rect (no letterbox offset needed since
-                // capW/capH always equal screenW/screenH).
-                _readbackTex.ReadPixels(new Rect(0, 0, capW, capH), 0, 0, false);
+                _readbackTex.ReadPixels(new Rect(0, 0, screenW, screenH), 0, 0, false);
                 _readbackTex.Apply(false);
 
                 byte[] jpeg = _readbackTex.EncodeToJPG(jpegQuality);
+
                 _capturer?.EnqueueJpeg(jpeg);
+                _lastEnqueueTime = Time.realtimeSinceStartup;
+
+                _captureCountThisSecond++;
+                _totalCaptureFrames++;
+                _totalCaptureBytes += jpeg.Length;
+
+                PrintStatsIfDue();
             }
         }
 
-        // ── Legacy callback (kept for API compatibility, no longer used) ────────
+        private void PrintStatsIfDue()
+        {
+            float now = Time.realtimeSinceStartup;
+            if (now - _lastStatsTime < 1f) return;
 
-        /// <summary>
-        /// Previously called by URPCaptureFeature with raw RGBA32 pixels.
-        /// Now unused — capture is driven by CaptureLoop coroutine.
-        /// Kept to avoid compile errors if any external code references it.
-        /// </summary>
+            float windowSec = now - _lastStatsTime;
+            float capFps    = _captureCountThisSecond / windowSec;
+            int   clients   = ClientCount;
+            long  avgBytes  = _totalCaptureFrames > 0
+                ? _totalCaptureBytes / _totalCaptureFrames : 0;
+
+            MBLog(
+                $"[MB][MobileBridge] STATS " +
+                $"capFps={capFps:F1} clients={clients} " +
+                $"skipNoClient={_captureSkipNoClientThisSecond} " +
+                $"skipThrottle={_captureSkipThrottleThisSecond} " +
+                $"avgJpegBytes={avgBytes} " +
+                $"totalFrames={_totalCaptureFrames}");
+
+            _captureCountThisSecond            = 0;
+            _captureSkipNoClientThisSecond     = 0;
+            _captureSkipThrottleThisSecond     = 0;
+            _lastStatsTime = now;
+        }
+
+        // ── Legacy callback (no longer used) ──────────────────────────────────
+
         [System.Obsolete("Frame capture is now driven by the internal CaptureLoop coroutine. This method is no longer called.")]
         public void OnFrameReady(byte[] rgba32, int width, int height)
         {
