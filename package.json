@@ -9,7 +9,6 @@
   "changelogUrl": "https://github.com/dengxuhui/unity-editor-touch-bridge/blob/main/CHANGELOG.md",
   "licensesUrl": "https://github.com/dengxuhui/unity-editor-touch-bridge/blob/main/LICENSE",
   "dependencies": {
-    "com.unity.inputsystem": "1.7.0",
     "com.unity.render-pipelines.universal": "14.0.0"
   },
   "keywords": [

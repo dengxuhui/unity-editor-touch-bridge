@@ -2,7 +2,6 @@
     "name": "MobileBridge.Runtime",
     "rootNamespace": "MobileBridge",
     "references": [
-        "Unity.InputSystem",
         "Unity.RenderPipelines.Universal.Runtime",
         "Unity.RenderPipelines.Core.Runtime"
     ],
@@ -13,6 +12,12 @@
     "precompiledReferences": [],
     "autoReferenced": true,
     "defineConstraints": [],
-    "versionDefines": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.inputsystem",
+            "expression": "1.7.0",
+            "define": "MOBILE_BRIDGE_INPUT_SYSTEM"
+        }
+    ],
     "noEngineReferences": false
 }

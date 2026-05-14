@@ -2,29 +2,31 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using UnityEngine;
+#if MOBILE_BRIDGE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.EnhancedTouch;
 using UnityEngine.InputSystem.LowLevel;
+#endif
 
 namespace MobileBridge
 {
     /// <summary>
     /// Subscribes to touch messages via injected delegates, parses JSON touch events,
-    /// and injects them into Unity Input System via a virtual Touchscreen device.
+    /// and injects them into the input system(s) present in the project.
     ///
-    /// Design notes:
-    /// - EnhancedTouchSupport.Enable() is called once and never disabled, so it
-    ///   cannot interfere with user project code that also uses EnhancedTouch.
-    /// - QueueStateEvent requires Allocator.Temp (main thread only). Messages
-    ///   arrive on a thread-pool thread, so we enqueue raw normalised coordinates
-    ///   into a ConcurrentQueue and drain on the main thread via Tick(), called
-    ///   from MobileBridge.Update().
-    /// - Coordinate conversion (NormalizedToUnity) is intentionally deferred to
-    ///   Tick() so that Screen.width / Screen.height are only accessed from the
-    ///   main thread.
+    /// New Input System path (when com.unity.inputsystem >= 1.7.0 is installed):
+    ///   Injects via a virtual Touchscreen device using QueueStateEvent.
+    ///   Guarded by MOBILE_BRIDGE_INPUT_SYSTEM (defined via asmdef versionDefines).
     ///
-    /// Dependencies are injected as delegates so this class compiles in the
-    /// Runtime assembly without any reference to WebSocketServer (Editor-only).
+    /// Legacy Input Manager path (always compiled):
+    ///   Maintains a per-frame Touch list exposed via LegacyTouches, consumed by
+    ///   LegacyTouchInput which is wired as StandaloneInputModule.inputOverride.
+    ///   Touches persist as Stationary across frames so drag/hold gestures work
+    ///   (the WS client never sends stationary events).
+    ///
+    /// QueueStateEvent requires main-thread access. Messages arrive on the WS
+    /// thread-pool thread, so raw normalised coordinates are enqueued into a
+    /// ConcurrentQueue and drained on the main thread via Tick().
     /// </summary>
     public sealed class TouchReceiver
     {
@@ -35,17 +37,17 @@ namespace MobileBridge
         private readonly Action<Action<string>> _unsubscribe;
 #endif
 
+#if MOBILE_BRIDGE_INPUT_SYSTEM
         private Touchscreen _touchDevice;
-        private bool _deviceOwned;
+        private bool        _deviceOwned;
+
+        // Caches screen-space start position per touchId so TouchState.startPosition
+        // is correct throughout a touch lifetime.
+        private readonly Dictionary<int, Vector2> _startPositions = new Dictionary<int, Vector2>();
+#endif
 
         // Thread-safe queue: WS thread produces, main thread consumes.
-        private readonly ConcurrentQueue<PendingTouch> _pending =
-            new ConcurrentQueue<PendingTouch>();
-
-        // Main-thread-only: caches the screen-space start position per touchId
-        // so TouchState.startPosition is correct throughout a touch lifetime.
-        private readonly Dictionary<int, Vector2> _startPositions =
-            new Dictionary<int, Vector2>();
+        private readonly ConcurrentQueue<PendingTouch> _pending = new ConcurrentQueue<PendingTouch>();
 
         // ── Legacy Input Manager state ─────────────────────────────────────────
         // StandaloneInputModule.inputOverride reads LegacyTouches each frame.
@@ -53,10 +55,10 @@ namespace MobileBridge
         // because the WS client only sends began/moved/ended — not stationary.
         private struct LegacyEntry
         {
-            public Vector2         position;
-            public Vector2         delta;
+            public Vector2              position;
+            public Vector2              delta;
             public UnityEngine.TouchPhase phase;
-            public bool            endedThisFrame;
+            public bool                 endedThisFrame;
         }
         private readonly Dictionary<int, LegacyEntry> _legacyActive     = new Dictionary<int, LegacyEntry>();
         private readonly List<int>                     _legacyRemoveNext = new List<int>();
@@ -80,6 +82,7 @@ namespace MobileBridge
 
         public void Start()
         {
+#if MOBILE_BRIDGE_INPUT_SYSTEM
             // EnhancedTouchSupport.Enable() is idempotent — safe to call even if
             // user code already called it. We intentionally never call Disable()
             // to avoid inadvertently breaking user code that depends on it.
@@ -89,12 +92,17 @@ namespace MobileBridge
             // Input Debugger and never confused with a real hardware touchscreen.
             _touchDevice = InputSystem.AddDevice<Touchscreen>("MobileBridgeTouch");
             _deviceOwned = true;
+#endif
 
 #if UNITY_EDITOR
             _subscribe?.Invoke(HandleMessage);
 #endif
 
-            MobileBridge.MBLog("[TouchReceiver] Started — virtual Touchscreen device added, EnhancedTouchSupport enabled.");
+            MobileBridge.MBLog("[TouchReceiver] Started."
+#if MOBILE_BRIDGE_INPUT_SYSTEM
+                + " Virtual Touchscreen device added, EnhancedTouchSupport enabled."
+#endif
+            );
         }
 
         public void Stop()
@@ -103,12 +111,14 @@ namespace MobileBridge
             _unsubscribe?.Invoke(HandleMessage);
 #endif
 
+#if MOBILE_BRIDGE_INPUT_SYSTEM
             if (_deviceOwned && _touchDevice != null && _touchDevice.added)
                 InputSystem.RemoveDevice(_touchDevice);
 
             _touchDevice = null;
             _deviceOwned = false;
             _startPositions.Clear();
+#endif
 
             _legacyActive.Clear();
             _legacyRemoveNext.Clear();
@@ -118,15 +128,16 @@ namespace MobileBridge
             // and the WS thread noticing the unsubscription.
             while (_pending.TryDequeue(out _)) { }
 
-            MobileBridge.MBLog("[TouchReceiver] Stopped — virtual Touchscreen device removed.");
+            MobileBridge.MBLog("[TouchReceiver] Stopped.");
         }
 
         // ── Main-thread drain ──────────────────────────────────────────────────
 
         /// <summary>
         /// Must be called every frame from the main thread (MonoBehaviour.Update).
-        /// Converts normalised coordinates, injects New IS TouchState events, and
-        /// maintains the Legacy touch list read by LegacyTouchInput.
+        /// Converts normalised coordinates, injects New IS TouchState events (when
+        /// MOBILE_BRIDGE_INPUT_SYSTEM is defined), and maintains the Legacy touch
+        /// list read by LegacyTouchInput.
         /// </summary>
         public void Tick()
         {
@@ -148,26 +159,28 @@ namespace MobileBridge
             }
 
             // ── Drain incoming queue ──────────────────────────────────────────
-            if (_touchDevice != null)
+            while (_pending.TryDequeue(out var t))
             {
-                while (_pending.TryDequeue(out var t))
-                {
-                    Vector2 pos = CoordinateMapper.NormalizedToUnity(t.nx, t.ny);
+                Vector2 pos = CoordinateMapper.NormalizedToUnity(t.nx, t.ny);
 
-                    // New Input System path (unchanged)
-                    if (t.phase == UnityEngine.InputSystem.TouchPhase.Began)
+#if MOBILE_BRIDGE_INPUT_SYSTEM
+                if (_touchDevice != null)
+                {
+                    var isPhase = ToISPhase(t.phase);
+
+                    if (isPhase == UnityEngine.InputSystem.TouchPhase.Began)
                         _startPositions[t.touchId] = pos;
 
                     _startPositions.TryGetValue(t.touchId, out Vector2 startPos);
 
-                    if (t.phase == UnityEngine.InputSystem.TouchPhase.Ended ||
-                        t.phase == UnityEngine.InputSystem.TouchPhase.Canceled)
+                    if (isPhase == UnityEngine.InputSystem.TouchPhase.Ended ||
+                        isPhase == UnityEngine.InputSystem.TouchPhase.Canceled)
                         _startPositions.Remove(t.touchId);
 
                     InputSystem.QueueStateEvent(_touchDevice, new TouchState
                     {
                         touchId       = t.touchId,
-                        phase         = t.phase,
+                        phase         = isPhase,
                         position      = pos,
                         startPosition = startPos,
                         // The touch with the lowest id (1-based) is designated primary.
@@ -180,21 +193,21 @@ namespace MobileBridge
                         // silently discarding the event.
                         radius         = Vector2.one,
                     });
-
-                    // Legacy path: update persistent state for this touch
-                    _legacyActive.TryGetValue(t.touchId, out LegacyEntry prev);
-                    var legacyPhase = ToLegacyPhase(t.phase);
-                    bool isEnd = legacyPhase == UnityEngine.TouchPhase.Ended ||
-                                 legacyPhase == UnityEngine.TouchPhase.Canceled;
-                    _legacyActive[t.touchId] = new LegacyEntry
-                    {
-                        position       = pos,
-                        delta          = pos - prev.position,
-                        phase          = legacyPhase,
-                        endedThisFrame = isEnd,
-                    };
-                    if (isEnd) _legacyRemoveNext.Add(t.touchId);
                 }
+#endif
+
+                // ── Legacy path ───────────────────────────────────────────────
+                _legacyActive.TryGetValue(t.touchId, out LegacyEntry prev);
+                bool isEnd = t.phase == UnityEngine.TouchPhase.Ended ||
+                             t.phase == UnityEngine.TouchPhase.Canceled;
+                _legacyActive[t.touchId] = new LegacyEntry
+                {
+                    position       = pos,
+                    delta          = pos - prev.position,
+                    phase          = t.phase,
+                    endedThisFrame = isEnd,
+                };
+                if (isEnd) _legacyRemoveNext.Add(t.touchId);
             }
 
             // ── Build legacy output list (read by LegacyTouchInput) ───────────
@@ -215,18 +228,6 @@ namespace MobileBridge
                     radius                  = 1f,
                     radiusVariance          = 0f,
                 });
-            }
-        }
-
-        private static UnityEngine.TouchPhase ToLegacyPhase(UnityEngine.InputSystem.TouchPhase p)
-        {
-            switch (p)
-            {
-                case UnityEngine.InputSystem.TouchPhase.Began:    return UnityEngine.TouchPhase.Began;
-                case UnityEngine.InputSystem.TouchPhase.Moved:    return UnityEngine.TouchPhase.Moved;
-                case UnityEngine.InputSystem.TouchPhase.Ended:    return UnityEngine.TouchPhase.Ended;
-                case UnityEngine.InputSystem.TouchPhase.Canceled: return UnityEngine.TouchPhase.Canceled;
-                default:                                           return UnityEngine.TouchPhase.Stationary;
             }
         }
 
@@ -259,7 +260,7 @@ namespace MobileBridge
                 return;
             }
 
-            UnityEngine.InputSystem.TouchPhase phase = ParsePhase(msg.eventType);
+            UnityEngine.TouchPhase phase = ParsePhase(msg.eventType);
 
 #if MOBILE_BRIDGE_DEBUG
             MobileBridge.MBLog($"[TouchReceiver] {msg.eventType} phase={phase} count={msg.touches.Length}");
@@ -279,26 +280,40 @@ namespace MobileBridge
 
         // ── Helpers ────────────────────────────────────────────────────────────
 
-        private static UnityEngine.InputSystem.TouchPhase ParsePhase(string evt)
+        private static UnityEngine.TouchPhase ParsePhase(string evt)
         {
             switch (evt)
             {
-                case "began":     return UnityEngine.InputSystem.TouchPhase.Began;
-                case "moved":     return UnityEngine.InputSystem.TouchPhase.Moved;
-                case "ended":     return UnityEngine.InputSystem.TouchPhase.Ended;
-                case "cancelled": return UnityEngine.InputSystem.TouchPhase.Canceled;
-                default:          return UnityEngine.InputSystem.TouchPhase.Stationary;
+                case "began":     return UnityEngine.TouchPhase.Began;
+                case "moved":     return UnityEngine.TouchPhase.Moved;
+                case "ended":     return UnityEngine.TouchPhase.Ended;
+                case "cancelled": return UnityEngine.TouchPhase.Canceled;
+                default:          return UnityEngine.TouchPhase.Stationary;
             }
         }
+
+#if MOBILE_BRIDGE_INPUT_SYSTEM
+        private static UnityEngine.InputSystem.TouchPhase ToISPhase(UnityEngine.TouchPhase p)
+        {
+            switch (p)
+            {
+                case UnityEngine.TouchPhase.Began:    return UnityEngine.InputSystem.TouchPhase.Began;
+                case UnityEngine.TouchPhase.Moved:    return UnityEngine.InputSystem.TouchPhase.Moved;
+                case UnityEngine.TouchPhase.Ended:    return UnityEngine.InputSystem.TouchPhase.Ended;
+                case UnityEngine.TouchPhase.Canceled: return UnityEngine.InputSystem.TouchPhase.Canceled;
+                default:                              return UnityEngine.InputSystem.TouchPhase.Stationary;
+            }
+        }
+#endif
 
         // ── Internal structures ────────────────────────────────────────────────
 
         private struct PendingTouch
         {
-            public int                                 touchId;
-            public UnityEngine.InputSystem.TouchPhase  phase;
-            public float                               nx;
-            public float                               ny;
+            public int                    touchId;
+            public UnityEngine.TouchPhase phase; // legacy phase, always available without IS package
+            public float                  nx;
+            public float                  ny;
         }
 
         [Serializable]
