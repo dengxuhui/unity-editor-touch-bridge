@@ -85,6 +85,23 @@ namespace MobileBridge
         /// <summary>True while the bridge is started. Read by URPCaptureFeature.</summary>
         public static bool IsActive { get; private set; }
 
+        /// <summary>
+        /// Current frame's bridged touches in Unity screen-space pixels.
+        /// Updated every frame before MonoBehaviour.Update runs.
+        /// Use this to feed bridged input into plugins that read UnityEngine.Input
+        /// directly (e.g. EasyTouch) instead of going through StandaloneInputModule.
+        /// Returns an empty list when the bridge is not active.
+        /// </summary>
+        public static System.Collections.Generic.IReadOnlyList<Touch> BridgedTouches
+        {
+            get
+            {
+                var list = Instance?._receiver?.LegacyTouches;
+                return list != null ? list : _emptyTouches;
+            }
+        }
+        private static readonly Touch[] _emptyTouches = System.Array.Empty<Touch>();
+
         /// <summary>Number of currently connected WebSocket clients.</summary>
         public int ClientCount
         {

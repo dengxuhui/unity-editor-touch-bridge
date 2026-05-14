@@ -65,7 +65,7 @@ namespace MobileBridge
         private readonly List<int>                     _legacyKeys       = new List<int>(); // avoids dict-enum alloc
         private readonly List<UnityEngine.Touch>       _legacyTouches    = new List<UnityEngine.Touch>(10);
 
-        internal IReadOnlyList<UnityEngine.Touch> LegacyTouches => _legacyTouches;
+        public IReadOnlyList<UnityEngine.Touch> LegacyTouches => _legacyTouches;
 
 #if UNITY_EDITOR
         public TouchReceiver(Action<Action<string>> subscribe,

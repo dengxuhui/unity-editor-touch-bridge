@@ -27,20 +27,27 @@ namespace MobileBridge
             return _touches[index];
         }
 
-        // Mirror primary touch as mouse so StandaloneInputModule's mouse fallback path
-        // (scroll, drag on non-touch UI) still gets a sensible position.
+        // When bridged touches are present, mirror primary touch as mouse so
+        // StandaloneInputModule's mouse fallback path (scroll, drag on non-touch UI)
+        // gets a sensible position. When no bridged touches, fall through to real
+        // mouse input so editor mouse interaction (e.g. UI joysticks without a
+        // connected browser) continues to work.
         public override Vector2 mousePosition =>
             _touches.Count > 0 ? _touches[0].position : base.mousePosition;
 
         public override bool GetMouseButtonDown(int button) =>
-            button == 0 && _touches.Count > 0 && _touches[0].phase == TouchPhase.Began;
+            _touches.Count > 0
+                ? button == 0 && _touches[0].phase == TouchPhase.Began
+                : base.GetMouseButtonDown(button);
 
         public override bool GetMouseButtonUp(int button) =>
-            button == 0 && _touches.Count > 0 &&
-            (_touches[0].phase == TouchPhase.Ended || _touches[0].phase == TouchPhase.Canceled);
+            _touches.Count > 0
+                ? button == 0 && (_touches[0].phase == TouchPhase.Ended || _touches[0].phase == TouchPhase.Canceled)
+                : base.GetMouseButtonUp(button);
 
         public override bool GetMouseButton(int button) =>
-            button == 0 && _touches.Count > 0 &&
-            _touches[0].phase != TouchPhase.Ended && _touches[0].phase != TouchPhase.Canceled;
+            _touches.Count > 0
+                ? button == 0 && _touches[0].phase != TouchPhase.Ended && _touches[0].phase != TouchPhase.Canceled
+                : base.GetMouseButton(button);
     }
 }
