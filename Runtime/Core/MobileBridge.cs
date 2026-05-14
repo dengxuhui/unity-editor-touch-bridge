@@ -1,6 +1,7 @@
 using System.Collections;
 using System.IO;
 using UnityEngine;
+using UnityEngine.EventSystems;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -105,8 +106,9 @@ namespace MobileBridge
 
         // ── Internal references ────────────────────────────────────────────────
 
-        private FrameCapturer _capturer;
-        private TouchReceiver _receiver;
+        private FrameCapturer  _capturer;
+        private TouchReceiver  _receiver;
+        private LegacyTouchInput _legacyInput;
 
         // Reusable texture for ReadPixels
         private Texture2D _readbackTex;
@@ -220,6 +222,7 @@ namespace MobileBridge
 
             _capturer.Start();
             _receiver.Start();
+            WireUpLegacyInput();
 
             IsActive = true;
             _lastStatsTime   = Time.realtimeSinceStartup;
@@ -234,6 +237,7 @@ namespace MobileBridge
             if (!IsActive) return;
             IsActive = false;
 
+            TearDownLegacyInput();
             _receiver?.Stop();
             _capturer?.Stop();
 
@@ -265,6 +269,29 @@ namespace MobileBridge
         private void Update()
         {
             _receiver?.Tick();
+            if (_legacyInput != null && _receiver != null)
+                _legacyInput.SetTouches(_receiver.LegacyTouches);
+        }
+
+        // ── Legacy Input Manager wiring ────────────────────────────────────────
+
+        private void WireUpLegacyInput()
+        {
+            var sim = FindObjectOfType<StandaloneInputModule>();
+            if (sim == null) return;
+            _legacyInput = gameObject.AddComponent<LegacyTouchInput>();
+            sim.inputOverride = _legacyInput;
+            MBLog("[MB][MobileBridge] StandaloneInputModule found — LegacyTouchInput wired as inputOverride.");
+        }
+
+        private void TearDownLegacyInput()
+        {
+            if (_legacyInput == null) return;
+            var sim = FindObjectOfType<StandaloneInputModule>();
+            if (sim != null && sim.inputOverride == _legacyInput)
+                sim.inputOverride = null;
+            Destroy(_legacyInput);
+            _legacyInput = null;
         }
 
         // ── Frame capture loop ─────────────────────────────────────────────────

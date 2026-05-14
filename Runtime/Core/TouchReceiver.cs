@@ -47,6 +47,24 @@ namespace MobileBridge
         private readonly Dictionary<int, Vector2> _startPositions =
             new Dictionary<int, Vector2>();
 
+        // ── Legacy Input Manager state ─────────────────────────────────────────
+        // StandaloneInputModule.inputOverride reads LegacyTouches each frame.
+        // Touches must persist across frames (Stationary) until Ended/Cancelled,
+        // because the WS client only sends began/moved/ended — not stationary.
+        private struct LegacyEntry
+        {
+            public Vector2         position;
+            public Vector2         delta;
+            public UnityEngine.TouchPhase phase;
+            public bool            endedThisFrame;
+        }
+        private readonly Dictionary<int, LegacyEntry> _legacyActive     = new Dictionary<int, LegacyEntry>();
+        private readonly List<int>                     _legacyRemoveNext = new List<int>();
+        private readonly List<int>                     _legacyKeys       = new List<int>(); // avoids dict-enum alloc
+        private readonly List<UnityEngine.Touch>       _legacyTouches    = new List<UnityEngine.Touch>(10);
+
+        internal IReadOnlyList<UnityEngine.Touch> LegacyTouches => _legacyTouches;
+
 #if UNITY_EDITOR
         public TouchReceiver(Action<Action<string>> subscribe,
                              Action<Action<string>> unsubscribe)
@@ -92,6 +110,10 @@ namespace MobileBridge
             _deviceOwned = false;
             _startPositions.Clear();
 
+            _legacyActive.Clear();
+            _legacyRemoveNext.Clear();
+            _legacyTouches.Clear();
+
             // Drain any queued events that arrived between Stop() being called
             // and the WS thread noticing the unsubscription.
             while (_pending.TryDequeue(out _)) { }
@@ -103,46 +125,108 @@ namespace MobileBridge
 
         /// <summary>
         /// Must be called every frame from the main thread (MonoBehaviour.Update).
-        /// Converts normalised coordinates and injects TouchState events.
+        /// Converts normalised coordinates, injects New IS TouchState events, and
+        /// maintains the Legacy touch list read by LegacyTouchInput.
         /// </summary>
         public void Tick()
         {
-            if (_touchDevice == null) return;
+            // ── Legacy: expire touches that ended last frame ───────────────────
+            foreach (int id in _legacyRemoveNext)
+                _legacyActive.Remove(id);
+            _legacyRemoveNext.Clear();
 
-            while (_pending.TryDequeue(out var t))
+            // ── Legacy: mark all still-active touches as Stationary ───────────
+            // (the WS client never sends stationary events; we synthesise them)
+            _legacyKeys.Clear();
+            _legacyKeys.AddRange(_legacyActive.Keys);
+            foreach (int id in _legacyKeys)
             {
-                Vector2 pos = CoordinateMapper.NormalizedToUnity(t.nx, t.ny);
+                var e = _legacyActive[id];
+                e.delta = Vector2.zero;
+                e.phase = UnityEngine.TouchPhase.Stationary;
+                _legacyActive[id] = e;
+            }
 
-                // Maintain per-touch start position.
-                if (t.phase == UnityEngine.InputSystem.TouchPhase.Began)
+            // ── Drain incoming queue ──────────────────────────────────────────
+            if (_touchDevice != null)
+            {
+                while (_pending.TryDequeue(out var t))
                 {
-                    _startPositions[t.touchId] = pos;
+                    Vector2 pos = CoordinateMapper.NormalizedToUnity(t.nx, t.ny);
+
+                    // New Input System path (unchanged)
+                    if (t.phase == UnityEngine.InputSystem.TouchPhase.Began)
+                        _startPositions[t.touchId] = pos;
+
+                    _startPositions.TryGetValue(t.touchId, out Vector2 startPos);
+
+                    if (t.phase == UnityEngine.InputSystem.TouchPhase.Ended ||
+                        t.phase == UnityEngine.InputSystem.TouchPhase.Canceled)
+                        _startPositions.Remove(t.touchId);
+
+                    InputSystem.QueueStateEvent(_touchDevice, new TouchState
+                    {
+                        touchId       = t.touchId,
+                        phase         = t.phase,
+                        position      = pos,
+                        startPosition = startPos,
+                        // The touch with the lowest id (1-based) is designated primary.
+                        // InputSystemUIInputModule and EnhancedTouch both rely on this
+                        // flag to drive pointer/drag events on UI elements.
+                        isPrimaryTouch = (t.touchId == 1),
+                        isTap          = false,
+                        tapCount       = 0,
+                        // A non-zero radius prevents some Input System versions from
+                        // silently discarding the event.
+                        radius         = Vector2.one,
+                    });
+
+                    // Legacy path: update persistent state for this touch
+                    _legacyActive.TryGetValue(t.touchId, out LegacyEntry prev);
+                    var legacyPhase = ToLegacyPhase(t.phase);
+                    bool isEnd = legacyPhase == UnityEngine.TouchPhase.Ended ||
+                                 legacyPhase == UnityEngine.TouchPhase.Canceled;
+                    _legacyActive[t.touchId] = new LegacyEntry
+                    {
+                        position       = pos,
+                        delta          = pos - prev.position,
+                        phase          = legacyPhase,
+                        endedThisFrame = isEnd,
+                    };
+                    if (isEnd) _legacyRemoveNext.Add(t.touchId);
                 }
+            }
 
-                _startPositions.TryGetValue(t.touchId, out Vector2 startPos);
-
-                if (t.phase == UnityEngine.InputSystem.TouchPhase.Ended ||
-                    t.phase == UnityEngine.InputSystem.TouchPhase.Canceled)
+            // ── Build legacy output list (read by LegacyTouchInput) ───────────
+            _legacyTouches.Clear();
+            foreach (var kvp in _legacyActive)
+            {
+                _legacyTouches.Add(new UnityEngine.Touch
                 {
-                    _startPositions.Remove(t.touchId);
-                }
-
-                InputSystem.QueueStateEvent(_touchDevice, new TouchState
-                {
-                    touchId                = t.touchId,
-                    phase                  = t.phase,
-                    position               = pos,
-                    startPosition          = startPos,
-                    // The touch with the lowest id (1-based) is designated primary.
-                    // InputSystemUIInputModule and EnhancedTouch both rely on this
-                    // flag to drive pointer/drag events on UI elements.
-                    isPrimaryTouch         = (t.touchId == 1),
-                    isTap                  = false,
-                    tapCount               = 0,
-                    // A non-zero radius prevents some Input System versions from
-                    // silently discarding the event.
-                    radius                 = Vector2.one,
+                    fingerId                = kvp.Key - 1, // back to 0-based for legacy API
+                    position                = kvp.Value.position,
+                    rawPosition             = kvp.Value.position,
+                    deltaPosition           = kvp.Value.delta,
+                    deltaTime               = Time.deltaTime,
+                    tapCount                = 1,
+                    phase                   = kvp.Value.phase,
+                    pressure                = 1f,
+                    maximumPossiblePressure = 1f,
+                    radius                  = 1f,
+                    radiusVariance          = 0f,
                 });
+            }
+        }
+
+        private static UnityEngine.TouchPhase ToLegacyPhase(UnityEngine.InputSystem.TouchPhase p)
+        {
+            switch (p)
+            {
+                case UnityEngine.InputSystem.TouchPhase.Began:    return UnityEngine.TouchPhase.Began;
+                case UnityEngine.InputSystem.TouchPhase.Moved:    return UnityEngine.TouchPhase.Moved;
+                case UnityEngine.InputSystem.TouchPhase.Ended:    return UnityEngine.TouchPhase.Ended;
+                case UnityEngine.InputSystem.TouchPhase.Canceled: return UnityEngine.TouchPhase.Canceled;
+                default:                                           return UnityEngine.TouchPhase.Stationary;
             }
         }
 
