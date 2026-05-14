@@ -74,7 +74,7 @@
 ## 三、UPM 包结构
 
 ```
-unity-mobile-bridge/                    ← Git 仓库根目录
+unity-editor-touch-bridge/             ← Git 仓库根目录
 ├── package.json                        ← UPM 包描述文件
 ├── README.md
 ├── CHANGELOG.md
@@ -86,27 +86,26 @@ unity-mobile-bridge/                    ← Git 仓库根目录
 │   │   ├── TouchReceiver.cs            ← 触控接收与注入
 │   │   └── CoordinateMapper.cs         ← 坐标换算
 │   ├── Capture/
-│   │   └── URPCaptureFeature.cs        ← ScriptableRendererFeature 实现
-│   ├── Network/
-│   │   └── WebSocketServer.cs          ← 基于 websocket-sharp
-│   ├── Plugins/
-│   │   └── websocket-sharp.dll         ← Runtime 依赖
+│   │   └── URPCaptureFeature.cs        ← ScriptableRendererFeature 空壳（保留兼容性）
 │   └── MobileBridge.Runtime.asmdef
 │
 ├── Editor/                             ← Editor Only（不进入玩家构建包）
+│   ├── Network/
+│   │   └── WebSocketServer.cs          ← websocket-sharp，Editor only
+│   ├── Plugins/
+│   │   └── websocket-sharp.dll         ← Editor only，不进入 Player Build
 │   ├── MobileBridgeWindow.cs           ← Editor 控制面板
 │   ├── SetupWizard.cs                  ← 首次配置向导
 │   ├── QRCodeGenerator.cs              ← 二维码生成
+│   ├── BridgeLogger.cs                 ← 诊断日志（文件 + Console）
 │   └── MobileBridge.Editor.asmdef      ← Editor Only
 │
 ├── WebClient/
 │   └── client.html                     ← 手机端网页（随包分发，运行时 serve）
 │
-├── Documentation~/
-│   └── index.md
-│
-└── Samples~/
-    └── BasicSetup/                     ← 示例场景，含配置好的 URP Renderer Asset
+└── Documentation~/
+    ├── ARCHITECTURE.md
+    └── DEVELOPMENT_PLAN.md
 ```
 
 ### package.json
@@ -220,7 +219,7 @@ private IEnumerator CaptureLoop()
 ```json
 {
   "type": "touch",
-  "event": "began | moved | ended | cancelled",
+  "eventType": "began | moved | ended | cancelled",
   "touches": [
     { "id": 0, "nx": 0.45, "ny": 0.32 },
     { "id": 1, "nx": 0.60, "ny": 0.55 }

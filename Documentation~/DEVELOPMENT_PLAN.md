@@ -91,7 +91,6 @@
 
 **执行项**
 - 完善 `README.md`、`Documentation~/`、FAQ 与已知限制。
-- 完善 `Samples~/` 示例：包含最小可运行场景与配置说明。
 - 核对 `package.json` 依赖与 Unity 版本声明。
 - 发布前检查：目录、asmdef、meta、许可证、变更日志一致。
 
