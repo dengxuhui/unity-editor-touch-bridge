@@ -225,6 +225,16 @@ namespace MobileBridge.Editor
 
             if (!inPlayMode)
                 EditorGUILayout.HelpBox("Enter Play Mode to start the bridge.", MessageType.Info);
+
+            if (inPlayMode && _isRunning)
+                EditorGUILayout.HelpBox(
+                    "触控生效需要 Game View 保持聚焦。\n" +
+                    "请点击 Game View 窗口使其获得焦点，手机触控即可正常注入。\n\n" +
+                    "Touch input requires the Game View to have focus.\n" +
+                    "Click the Game View window first, then touch events from your phone will work correctly.\n\n" +
+                    "画面串流不受此影响，始终正常推送。\n" +
+                    "Video streaming is unaffected and always active.",
+                    MessageType.Warning);
         }
 
         // ── Actions ────────────────────────────────────────────────────────────

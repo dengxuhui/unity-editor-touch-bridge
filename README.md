@@ -73,6 +73,14 @@ Unity Editor (Game View)
                                              Unity TouchReceiver → Input System
 ```
 
+## 已知限制
+
+### 触控输入需要 Game View 聚焦
+
+触控事件通过 Unity Input System 虚拟 `Touchscreen` 设备注入。Input System 在 Editor 下的默认行为（`PointersAndKeyboardsRespectGameViewFocus`）会在 Game View 失去焦点时过滤所有 `Pointer` 类设备（`Touchscreen` 继承自 `Pointer`）的输入事件——这是 Input System 内部的硬编码逻辑，无法通过插件侧绕过。
+
+**使用方式**：启动 Bridge 后，点击 Game View 窗口使其获得焦点，然后在手机上操作即可正常收到触控。画面串流不受焦点影响，始终正常推送。Mobile Bridge 面板在 Bridge 运行时会显示此提示。
+
 ## 许可证
 
 [LICENSE](LICENSE)
