@@ -9,23 +9,32 @@ using UnityEngine.InputSystem.LowLevel;
 namespace MobileBridge
 {
     /// <summary>
-    /// Subscribes to WebSocketServer.OnTouchMessage, parses JSON touch events,
+    /// Subscribes to touch messages via injected delegates, parses JSON touch events,
     /// and injects them into Unity Input System via a virtual Touchscreen device.
     ///
     /// Design notes:
     /// - EnhancedTouchSupport.Enable() is called once and never disabled, so it
     ///   cannot interfere with user project code that also uses EnhancedTouch.
-    /// - QueueStateEvent requires Allocator.Temp (main thread only). WebSocket
-    ///   messages arrive on a thread-pool thread, so we enqueue raw normalised
-    ///   coordinates into a ConcurrentQueue and drain on the main thread via
-    ///   Tick(), called from MobileBridge.Update().
+    /// - QueueStateEvent requires Allocator.Temp (main thread only). Messages
+    ///   arrive on a thread-pool thread, so we enqueue raw normalised coordinates
+    ///   into a ConcurrentQueue and drain on the main thread via Tick(), called
+    ///   from MobileBridge.Update().
     /// - Coordinate conversion (NormalizedToUnity) is intentionally deferred to
     ///   Tick() so that Screen.width / Screen.height are only accessed from the
     ///   main thread.
+    ///
+    /// Dependencies are injected as delegates so this class compiles in the
+    /// Runtime assembly without any reference to WebSocketServer (Editor-only).
     /// </summary>
     public sealed class TouchReceiver
     {
-        private readonly WebSocketServer _server;
+#if UNITY_EDITOR
+        // subscribe(handler)   — called in Start()
+        // unsubscribe(handler) — called in Stop()
+        private readonly Action<Action<string>> _subscribe;
+        private readonly Action<Action<string>> _unsubscribe;
+#endif
+
         private Touchscreen _touchDevice;
         private bool _deviceOwned;
 
@@ -38,10 +47,16 @@ namespace MobileBridge
         private readonly Dictionary<int, Vector2> _startPositions =
             new Dictionary<int, Vector2>();
 
-        public TouchReceiver(WebSocketServer server)
+#if UNITY_EDITOR
+        public TouchReceiver(Action<Action<string>> subscribe,
+                             Action<Action<string>> unsubscribe)
         {
-            _server = server;
+            _subscribe   = subscribe;
+            _unsubscribe = unsubscribe;
         }
+#else
+        public TouchReceiver() { }
+#endif
 
         // ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -57,14 +72,18 @@ namespace MobileBridge
             _touchDevice = InputSystem.AddDevice<Touchscreen>("MobileBridgeTouch");
             _deviceOwned = true;
 
-            _server.OnTouchMessage += HandleMessage;
+#if UNITY_EDITOR
+            _subscribe?.Invoke(HandleMessage);
+#endif
 
             MobileBridge.MBLog("[TouchReceiver] Started — virtual Touchscreen device added, EnhancedTouchSupport enabled.");
         }
 
         public void Stop()
         {
-            _server.OnTouchMessage -= HandleMessage;
+#if UNITY_EDITOR
+            _unsubscribe?.Invoke(HandleMessage);
+#endif
 
             if (_deviceOwned && _touchDevice != null && _touchDevice.added)
                 InputSystem.RemoveDevice(_touchDevice);

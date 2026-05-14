@@ -7,12 +7,15 @@ using WebSocketSharp;
 using WebSocketSharp.Net;
 using WebSocketSharp.Server;
 
-namespace MobileBridge
+namespace MobileBridge.Editor
 {
     /// <summary>
     /// Runs two local-network servers:
     ///   port 8765 — WebSocket (WS): binary frame push down, JSON touch up
     ///   port 8766 — HTTP static file server: serves client.html on GET /
+    ///
+    /// Lives in the Editor assembly so websocket-sharp.dll is never included
+    /// in player builds.
     /// </summary>
     public sealed class WebSocketServer : IDisposable
     {
@@ -68,8 +71,8 @@ namespace MobileBridge
                 dueTime:  TimeSpan.FromSeconds(1),
                 period:   TimeSpan.FromSeconds(1));
 
-            MobileBridge.MBLog($"[MB][WebSocketServer] WS listening on :{WsPort}");
-            MobileBridge.MBLog($"[MB][WebSocketServer] HTTP listening on :{HttpPort}");
+            Debug.Log($"[MB][WebSocketServer] WS listening on :{WsPort}");
+            Debug.Log($"[MB][WebSocketServer] HTTP listening on :{HttpPort}");
         }
 
         public void Stop()
@@ -78,7 +81,7 @@ namespace MobileBridge
             try { _wsServer?.Stop(); }   catch { }
             try { _httpServer?.Stop(); } catch { }
 
-            MobileBridge.MBLog($"[MB][WebSocketServer] Stopped. totalBroadcasts={_totalBroadcasts} " +
+            Debug.Log($"[MB][WebSocketServer] Stopped. totalBroadcasts={_totalBroadcasts} " +
                       $"avgBroadcastMs={(_totalBroadcasts > 0 ? _totalBroadcastMs / _totalBroadcasts : 0)} " +
                       $"slowBroadcasts={_slowBroadcastCount}");
         }
@@ -89,14 +92,14 @@ namespace MobileBridge
             var sessions = _wsServer?.WebSocketServices["/"]?.Sessions;
             if (sessions == null || sessions.Count == 0)
             {
-                MobileBridge.MBLog($"[MB][WebSocketServer] BroadcastText skipped — no sessions (text={text})");
+                Debug.Log($"[MB][WebSocketServer] BroadcastText skipped — no sessions (text={text})");
                 return;
             }
-            MobileBridge.MBLog($"[MB][WebSocketServer] BroadcastText clients={sessions.Count} text={text}");
+            Debug.Log($"[MB][WebSocketServer] BroadcastText clients={sessions.Count} text={text}");
             try { sessions.Broadcast(text); }
             catch (Exception ex)
             {
-                MobileBridge.MBLogWarning($"[MB][WebSocketServer] WARN broadcast_text_exception — {ex.GetType().Name}: {ex.Message}");
+                Debug.LogWarning($"[MB][WebSocketServer] WARN broadcast_text_exception — {ex.GetType().Name}: {ex.Message}");
             }
         }
 
@@ -105,25 +108,25 @@ namespace MobileBridge
         {
             var sessions = _wsServer?.WebSocketServices["/"]?.Sessions;
             if (sessions == null) return;
-            MobileBridge.MBLog($"[MB][WebSocketServer] SendText id={sessionId} text={text}");
+            Debug.Log($"[MB][WebSocketServer] SendText id={sessionId} text={text}");
             try
             {
                 sessions.SendTo(text, sessionId);
             }
             catch (Exception ex)
             {
-                MobileBridge.MBLogWarning($"[MB][WebSocketServer] WARN send_text_exception id={sessionId} — {ex.GetType().Name}: {ex.Message}");
+                Debug.LogWarning($"[MB][WebSocketServer] WARN send_text_exception id={sessionId} — {ex.GetType().Name}: {ex.Message}");
             }
         }
 
-        /// <summary>Broadcast a JPEG frame to all connected clients.</summary>
-        public Task BroadcastFrameAsync(byte[] jpegBytes)
+        /// <summary>Broadcast a JPEG frame to all connected clients (synchronous).</summary>
+        public void BroadcastFrame(byte[] jpegBytes)
         {
             var sessions = _wsServer?.WebSocketServices["/"]?.Sessions;
-            if (sessions == null) return Task.CompletedTask;
+            if (sessions == null) return;
 
             int count = sessions.Count;
-            if (count == 0) return Task.CompletedTask;
+            if (count == 0) return;
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
             try
@@ -133,10 +136,10 @@ namespace MobileBridge
             catch (Exception ex)
             {
                 sw.Stop();
-                MobileBridge.MBLogWarning(
+                Debug.LogWarning(
                     $"[MB][WebSocketServer] WARN broadcast_exception — " +
                     $"{ex.GetType().Name}: {ex.Message} clients={count}");
-                return Task.CompletedTask;
+                return;
             }
             sw.Stop();
 
@@ -147,12 +150,10 @@ namespace MobileBridge
             if (ms > 300)
             {
                 Interlocked.Increment(ref _slowBroadcastCount);
-                MobileBridge.MBLogWarning(
+                Debug.LogWarning(
                     $"[MB][WebSocketServer] WARN broadcast_slow — " +
                     $"{ms}ms for {count} client(s) frameSize={jpegBytes.Length}B");
             }
-
-            return Task.CompletedTask;
         }
 
         public void Dispose()
@@ -162,8 +163,7 @@ namespace MobileBridge
             Stop();
         }
 
-        /// <summary>Broadcast a lightweight heartbeat text frame every second.
-        /// Lets the client distinguish "ws alive but no video" from "truly disconnected".</summary>
+        /// <summary>Broadcast a lightweight heartbeat text frame every second.</summary>
         private void SendHeartbeat()
         {
             var sessions = _wsServer?.WebSocketServices["/"]?.Sessions;
@@ -193,7 +193,7 @@ namespace MobileBridge
             }
             catch (Exception ex)
             {
-                MobileBridge.MBLogWarning($"[MB][WebSocketServer] HTTP error: {ex.Message}");
+                Debug.LogWarning($"[MB][WebSocketServer] HTTP error: {ex.Message}");
                 res.StatusCode = 500;
             }
         }
@@ -222,7 +222,7 @@ namespace MobileBridge
         private void OnSessionEvent(string sessionId, string eventName, string detail)
         {
             int count = ClientCount;
-            MobileBridge.MBLog($"[MB][WebSocketServer] session_{eventName} id={sessionId} clients={count} {detail}");
+            Debug.Log($"[MB][WebSocketServer] session_{eventName} id={sessionId} clients={count} {detail}");
             if (eventName == "open")
                 OnClientConnected?.Invoke(sessionId);
             else if (eventName == "hello")
@@ -254,20 +254,17 @@ namespace MobileBridge
 
             protected override void OnError(WebSocketSharp.ErrorEventArgs e)
             {
-                MobileBridge.MBLogWarning($"[MB][WebSocketServer] WARN session_error id={ID} msg={e.Message}");
+                Debug.LogWarning($"[MB][WebSocketServer] WARN session_error id={ID} msg={e.Message}");
             }
 
             protected override void OnMessage(MessageEventArgs e)
             {
                 if (!e.IsText) return;
-                // Check for hello handshake before forwarding as touch message
                 try
                 {
-                    // Fast path: only parse if looks like a hello
                     if (e.Data.Contains("\"hello\""))
                     {
                         var msg = e.Data.Trim();
-                        // Simple check without full JSON parse to avoid allocation on every touch event
                         if (msg.Contains("\"type\"") && msg.Contains("\"hello\""))
                         {
                             _onEvent?.Invoke(ID, "hello", "");

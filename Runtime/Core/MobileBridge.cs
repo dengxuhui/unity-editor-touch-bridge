@@ -14,22 +14,67 @@ namespace MobileBridge
     [DefaultExecutionOrder(-1000)]
     public sealed class MobileBridge : MonoBehaviour
     {
-        // ── Editor injection point ─────────────────────────────────────────────
+        // ── Editor injection points ────────────────────────────────────────────
+        // All fields in this block are Editor-only and are bound by the Editor
+        // assembly ([InitializeOnLoad] or just before StartBridge). They must
+        // NEVER be referenced outside a #if UNITY_EDITOR guard so the Runtime
+        // assembly compiles cleanly without any Editor dependency.
 #if UNITY_EDITOR
         /// <summary>
-        /// Injected by the Editor assembly ([InitializeOnLoad]) to provide the
-        /// current "show client debug overlay" preference without Runtime → Editor
-        /// assembly dependency.
+        /// Injected by the Editor assembly to provide the current
+        /// "show client debug overlay" preference.
         /// </summary>
         public static System.Func<bool> ClientDebugOverlayProvider;
 
         /// <summary>
-        /// Injected by the Editor assembly ([InitializeOnLoad]) to indicate whether
-        /// MobileBridge logs should be printed to the Unity Console. When null or
-        /// returning true, all Debug.Log calls are active (default for development).
-        /// Set to a provider returning false to suppress console output.
+        /// Injected by the Editor assembly to indicate whether MobileBridge logs
+        /// should be printed to the Unity Console.
         /// </summary>
         public static System.Func<bool> ConsoleLoggingProvider;
+
+        // ── Network delegates (bound by MobileBridgeWindow before StartBridge) ─
+
+        /// <summary>Returns the number of currently connected WebSocket clients.</summary>
+        public static System.Func<int> ClientCountProvider;
+
+        /// <summary>Broadcast a binary JPEG frame to all connected clients.</summary>
+        public static System.Action<byte[]> BroadcastFrameAction;
+
+        /// <summary>Broadcast a text message to all connected clients.</summary>
+        public static System.Action<string> BroadcastTextAction;
+
+        /// <summary>Send a text message to a single session by ID.</summary>
+        public static System.Action<string, string> SendTextAction;
+
+        /// <summary>Start the WebSocket + HTTP servers.</summary>
+        public static System.Action StartServerAction;
+
+        /// <summary>Stop the WebSocket + HTTP servers.</summary>
+        public static System.Action StopServerAction;
+
+        /// <summary>
+        /// Register a handler for the OnHelloReceived server event.
+        /// Arg: the handler Action&lt;string sessionId&gt;.
+        /// </summary>
+        public static System.Action<System.Action<string>> RegisterHelloHandler;
+
+        /// <summary>
+        /// Register a handler for the OnClientConnected server event.
+        /// Arg: the handler Action&lt;string sessionId&gt;.
+        /// </summary>
+        public static System.Action<System.Action<string>> RegisterConnectHandler;
+
+        /// <summary>
+        /// Subscribe a touch message handler.
+        /// Used by TouchReceiver.Start().
+        /// </summary>
+        public static System.Action<System.Action<string>> RegisterTouchHandler;
+
+        /// <summary>
+        /// Unsubscribe a touch message handler.
+        /// Used by TouchReceiver.Stop().
+        /// </summary>
+        public static System.Action<System.Action<string>> UnregisterTouchHandler;
 #endif
 
         // ── Public API ─────────────────────────────────────────────────────────
@@ -40,7 +85,17 @@ namespace MobileBridge
         public static bool IsActive { get; private set; }
 
         /// <summary>Number of currently connected WebSocket clients.</summary>
-        public int ClientCount => _server?.ClientCount ?? 0;
+        public int ClientCount
+        {
+            get
+            {
+#if UNITY_EDITOR
+                return ClientCountProvider?.Invoke() ?? 0;
+#else
+                return 0;
+#endif
+            }
+        }
 
         // ── Inspector fields ───────────────────────────────────────────────────
 
@@ -50,16 +105,14 @@ namespace MobileBridge
 
         // ── Internal references ────────────────────────────────────────────────
 
-        private WebSocketServer _server;
-        private FrameCapturer   _capturer;
-        private TouchReceiver   _receiver;
+        private FrameCapturer _capturer;
+        private TouchReceiver _receiver;
 
         // Reusable texture for ReadPixels
         private Texture2D _readbackTex;
         private float     _lastCaptureTime;
 
         // ── Capture diagnostics ────────────────────────────────────────────────
-        // Counters reset each second for per-second stats logging.
         private int   _captureCountThisSecond;
         private int   _captureSkipNoClientThisSecond;
         private int   _captureSkipThrottleThisSecond;
@@ -137,42 +190,43 @@ namespace MobileBridge
                 return;
             }
 
-            _server   = new WebSocketServer(ClientHtmlPath);
-            _capturer = new FrameCapturer(_server);
-            _receiver = new TouchReceiver(_server);
-
-            _server.Start();
-            _capturer.Start();
-            _receiver.Start();
-
 #if UNITY_EDITOR
-            // Primary path: client sends hello → server replies with directed cfg.
-            // This is reliable because the session is already registered when hello arrives.
-            _server.OnHelloReceived += sessionId =>
+            // Start the servers first so sessions/events are available
+            StartServerAction?.Invoke();
+
+            // Subscribe to session events before any client can connect
+            RegisterHelloHandler?.Invoke(sessionId =>
             {
                 bool show = ClientDebugOverlayProvider?.Invoke() ?? false;
                 string cfg = $"{{\"type\":\"cfg\",\"showDebug\":{(show ? "true" : "false")}}}";
                 MBLog($"[MB][MobileBridge] hello_recv id={sessionId} → sending cfg showDebug={show}");
-                _server.SendText(sessionId, cfg);
-            };
-            // Fallback path: directed send on connect (session is registered at this point in
-            // websocket-sharp, but we use SendTo rather than Broadcast to avoid timing issues).
-            _server.OnClientConnected += sessionId =>
+                SendTextAction?.Invoke(sessionId, cfg);
+            });
+
+            RegisterConnectHandler?.Invoke(sessionId =>
             {
                 bool show = ClientDebugOverlayProvider?.Invoke() ?? false;
                 string cfg = $"{{\"type\":\"cfg\",\"showDebug\":{(show ? "true" : "false")}}}";
                 MBLog($"[MB][MobileBridge] client_connected id={sessionId} → sending cfg showDebug={show}");
-                _server.SendText(sessionId, cfg);
-            };
+                SendTextAction?.Invoke(sessionId, cfg);
+            });
+
+            _capturer = new FrameCapturer(BroadcastFrameAction, ClientCountProvider);
+            _receiver = new TouchReceiver(RegisterTouchHandler, UnregisterTouchHandler);
+#else
+            _capturer = new FrameCapturer();
+            _receiver = new TouchReceiver();
 #endif
 
+            _capturer.Start();
+            _receiver.Start();
+
             IsActive = true;
-            _lastStatsTime  = Time.realtimeSinceStartup;
+            _lastStatsTime   = Time.realtimeSinceStartup;
             _lastEnqueueTime = Time.realtimeSinceStartup;
             StartCoroutine(CaptureLoop());
 
-            MBLog($"[MB][MobileBridge] Started — WS:{WebSocketServer.WsPort}  HTTP:{WebSocketServer.HttpPort} " +
-                      $"targetFps={targetFps} jpegQuality={jpegQuality}");
+            MBLog($"[MB][MobileBridge] Started — targetFps={targetFps} jpegQuality={jpegQuality}");
         }
 
         public void StopBridge()
@@ -182,12 +236,13 @@ namespace MobileBridge
 
             _receiver?.Stop();
             _capturer?.Stop();
-            _server?.Stop();
-            _server?.Dispose();
+
+#if UNITY_EDITOR
+            StopServerAction?.Invoke();
+#endif
 
             _receiver = null;
             _capturer = null;
-            _server   = null;
 
             MBLog($"[MB][MobileBridge] Stopped. totalFrames={_totalCaptureFrames} " +
                        $"totalBytes={_totalCaptureBytes}");
@@ -195,13 +250,14 @@ namespace MobileBridge
 
         /// <summary>
         /// Broadcast a config message to all connected clients.
-        /// Called by the Editor menu to push settings (e.g. show/hide debug overlay)
-        /// without requiring a reconnect.
+        /// Called by the Editor menu to push settings without requiring a reconnect.
         /// </summary>
         public void BroadcastConfigMessage(bool showDebug)
         {
             MBLog($"[MB][MobileBridge] BroadcastConfigMessage showDebug={showDebug} clients={ClientCount}");
-            _server?.BroadcastText($"{{\"type\":\"cfg\",\"showDebug\":{(showDebug ? "true" : "false")}}}");
+#if UNITY_EDITOR
+            BroadcastTextAction?.Invoke($"{{\"type\":\"cfg\",\"showDebug\":{(showDebug ? "true" : "false")}}}");
+#endif
         }
 
         // ── MonoBehaviour update ───────────────────────────────────────────────
@@ -246,7 +302,6 @@ namespace MobileBridge
                     MBLogWarning(
                         $"[MB][MobileBridge] WARN capture_stall — " +
                         $"{(now - _lastEnqueueTime) * 1000f:F0}ms since last enqueue, clients={clients}");
-                    // Reset to avoid spam every frame
                     _lastEnqueueTime = now;
                 }
 

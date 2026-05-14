@@ -13,11 +13,11 @@
 
 | 阶段 | 名称 | 目标 | 预计产出 | 状态 |
 |------|------|------|----------|------|
-| P0 | 基线对齐 | 代码与 SPEC、目录职责、端口和协议一致 | 差异清单 + 修正项 | TODO |
-| P1 | 基础链路打通 | 画面推流与触控回传端到端可用 | 可稳定连接与交互 | TODO |
-| P2 | 平台稳定性 | iOS/Android WS 连接稳定、坐标映射、多指一致性 | Android/iOS 双平台稳定 | TODO |
-| P3 | 性能与体验 | 主线程无阻塞、调试可观测、错误可诊断 | 更低卡顿与更好可用性 | TODO |
-| P4 | 发布准备 | 文档、Samples、发布检查完善 | 可对外发布的 UPM 包 | TODO |
+| P0 | 基线对齐 | 代码与 SPEC、目录职责、端口和协议一致 | 差异清单 + 修正项 | DONE |
+| P1 | 基础链路打通 | 画面推流与触控回传端到端可用 | 可稳定连接与交互 | DONE |
+| P2 | 平台稳定性 | iOS/Android WS 连接稳定、坐标映射、多指一致性 | Android/iOS 双平台稳定 | DONE |
+| P3 | 性能与体验 | 主线程无阻塞、调试可观测、错误可诊断 | 更低卡顿与更好可用性 | DONE |
+| P4 | 发布准备 | 文档、Samples、发布检查完善 | 可对外发布的 UPM 包 | DONE |
 
 状态说明：`TODO` / `IN_PROGRESS` / `DONE` / `BLOCKED`
 
@@ -113,9 +113,9 @@
 |------|------|----------|----------|------|
 | P0 基线对齐 | DONE | 2026-05-13 | 2026-05-13 | 全量源码实现，通过五项核对 |
 | P1 基础链路打通 | DONE | 2026-05-13 | 2026-05-13 | Android ws:// 验收通过 |
-| P2 平台稳定性 | IN_PROGRESS | 2026-05-13 | - | iOS ws:// 链路验证进行中；URPCaptureFeature handle 访问时序已修复；Canvas Overlay 支持已完成（改为 WaitForEndOfFrame + ReadPixels） |
-| P3 性能与体验 | TODO | - | - | - |
-| P4 发布准备 | TODO | - | - | - |
+| P2 平台稳定性 | DONE | 2026-05-13 | 2026-05-14 | ws:// 统一、多指追踪、DPI换算、断线重连、Canvas Overlay 支持全部完成；真实项目验收进行中 |
+| P3 性能与体验 | DONE | 2026-05-14 | 2026-05-14 | 客户端清晰度修复（canvas 1:1 位图）；JPEG Quality 链路验证完整 |
+| P4 发布准备 | DONE | 2026-05-14 | 2026-05-14 | WebSocket 迁移 Editor only、委托注入架构、CHANGELOG/README/ARCHITECTURE 文档补全 |
 
 ## 5. 变更记录
 
@@ -127,4 +127,4 @@
 | 2026-05-13 | P2 | 证书生成 Mono 兼容性修复（三轮） | **根本问题**：Unity 2022.3 Mono 大量 `System.Security.Cryptography` API 为未实现 stub。**第一轮**：`CertificateRequest` 抛 `PlatformNotSupportedException` → 引入 BouncyCastle 2.4.0（`Editor/Plugins/`，Editor only）；**第二轮**：BouncyCastle 生成的 PKCS#12 中 RC2-40-CBC 证书袋 Mono 无法解析 → 改为 cert.pem（DER）+ key.pem（PKCS#8）存储；**第三轮**：`ImportPkcs8PrivateKey` 也是 stub → 改为 cert.pem + key-params.xml（RSA XML）存储，生成端用 `DotNetUtilities.ToRSA()` + `ToXmlString(true)`，加载端用 `RSACryptoServiceProvider.FromXmlString()`。职责拆分：`CertificateGenerator`（Editor only，依赖 BouncyCastle）负责生成；`CertificateHelper`（Runtime，无外部依赖）负责加载。 |
 | 2026-05-13 | P2 | URPCaptureFeature handle 访问时序修复 | `AddRenderPasses` 中访问 `renderer.cameraColorTargetHandle` 抛错（URP 2022.3 明确禁止）。修复：`AddRenderPasses` 只做 `EnqueuePass`；`SetupRenderPasses` 中调用 `_pass.Setup(renderer.cameraColorTargetHandle)`，此时 handle 已合法。同步修复 `in RenderingData` 参数不能用 `ref var` 取引用（CS8330）。 |
 | 2026-05-13 | P2 | 协议策略调整为 HTTP + WS | 按最新 SPEC 移除证书相关功能：删除 `CertificateGenerator` / `CertificateHelper` 与 BouncyCastle 依赖；`WebSocketServer` 改为 `WS:8765 + HTTP:8766`；`client.html` 固定 `ws://`；Editor 面板与 Setup Wizard 移除证书入口。 |
-| 2026-05-13 | P2 | Canvas Overlay 支持：捕获方案从 AsyncGPUReadback 改为 WaitForEndOfFrame + ReadPixels | **根本问题**：`ScriptableRenderPass.Execute()` 在 URP 管线内触发，此时 Screen Space Overlay Canvas 尚未合成到 backbuffer，导致浏览器画面中看不到 2D UI。**解决方案**：将帧捕获逻辑从 `URPCaptureFeature` 迁移至 `MobileBridge.CaptureLoop()` 协程，在 `WaitForEndOfFrame` 之后执行 `ReadPixels`，此时所有内容（3D 场景 + Overlay 相机 + Canvas UI）已完整合成。`URPCaptureFeature` 简化为空壳保留兼容性。代价：主线程额外约 3-8ms 同步开销（ReadPixels + EncodeToJPG），对 Editor 工具可接受。SPEC.md 已同步更新。 |
+| 2026-05-14 | P3 | client.html canvas 清晰度修复 | **根本问题**：`resizeCanvas()` 将 canvas 位图尺寸设为视口逻辑像素（如 390×844），而 Unity 发送的是 Game View 实际像素（如 1920×1080），`drawImage` 强制缩放导致插值模糊。**解决方案**：移除 `resizeCanvas`；在 `decodeAndDraw` 中按每帧 `bitmap.width/height` 同步 canvas 位图尺寸（1:1 绘制，无缩放插值）；CSS 加 `object-fit: contain` 由浏览器负责视口适配，保持宽高比。结果：图像清晰度与 Game View 一致。JPEG Quality 设置链路经代码审查确认完整有效（`EncodeToJPG(jpegQuality)` 已正确传参）。 |

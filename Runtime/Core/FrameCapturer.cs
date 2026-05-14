@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Threading;
-using UnityEngine;
 
 namespace MobileBridge
 {
@@ -13,11 +12,18 @@ namespace MobileBridge
     ///   ① MobileBridge.CaptureLoop (main thread, WaitForEndOfFrame)
     ///        → ReadPixels + EncodeToJPG
     ///        → EnqueueJpeg
-    ///   ② This class (background thread) → WebSocket broadcast
+    ///   ② This class (background thread) → broadcastFrame delegate
+    ///
+    /// Dependencies are injected as delegates so this class compiles in the
+    /// Runtime assembly without any reference to WebSocketServer (Editor-only).
     /// </summary>
     public sealed class FrameCapturer
     {
-        private readonly WebSocketServer _server;
+        // Injected by MobileBridge.cs (bound by Editor before StartBridge).
+#if UNITY_EDITOR
+        private readonly Action<byte[]> _broadcastFrame;
+        private readonly Func<int>      _clientCount;
+#endif
 
         // Capacity 2: if the send thread falls behind, drop new frames.
         private readonly BlockingCollection<byte[]> _queue = new BlockingCollection<byte[]>(2);
@@ -35,7 +41,6 @@ namespace MobileBridge
         private long _slowSendCount;
 
         // Timestamps (Environment.TickCount, ms) — written by send thread only.
-        // Using int cast to long to avoid sign issues over long sessions.
         private long _lastDequeueMs;
         private long _lastSendOkMs;
 
@@ -48,10 +53,15 @@ namespace MobileBridge
         // Stall detection: if clients are connected and nothing is sent for this long, warn.
         private const long StallThresholdMs = 2000;
 
-        public FrameCapturer(WebSocketServer server)
+#if UNITY_EDITOR
+        public FrameCapturer(Action<byte[]> broadcastFrame, Func<int> clientCount)
         {
-            _server = server;
+            _broadcastFrame = broadcastFrame;
+            _clientCount    = clientCount;
         }
+#else
+        public FrameCapturer() { }
+#endif
 
         public void Start()
         {
@@ -121,10 +131,11 @@ namespace MobileBridge
 
                 _lastDequeueMs = (long)Environment.TickCount;
 
+#if UNITY_EDITOR
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
-                    _server.BroadcastFrameAsync(jpeg).GetAwaiter().GetResult();
+                    _broadcastFrame?.Invoke(jpeg);
                     sw.Stop();
 
                     long elapsedMs = sw.ElapsedMilliseconds;
@@ -138,7 +149,7 @@ namespace MobileBridge
                         Interlocked.Add(ref _totalSendSlowMs, elapsedMs);
                         MobileBridge.MBLogWarning(
                             $"[MB][FrameCapturer] WARN broadcast_slow — took {elapsedMs}ms " +
-                            $"(clients={_server.ClientCount})");
+                            $"(clients={_clientCount?.Invoke() ?? 0})");
                     }
                 }
                 catch (Exception ex)
@@ -148,29 +159,34 @@ namespace MobileBridge
                     MobileBridge.MBLogWarning(
                         $"[MB][FrameCapturer] WARN send_error — {ex.GetType().Name}: {ex.Message}");
                 }
+#endif
 
                 // Print per-second stats + stall check
                 PrintStatsIfDue();
             }
 
-            MobileBridge.MBLog("[MB][FrameCapturer] Send thread exited.");        }
+            MobileBridge.MBLog("[MB][FrameCapturer] Send thread exited.");
+        }
 
         private void PrintStatsIfDue()
         {
             long now = (long)Environment.TickCount;
             if (now - _statsLastPrintMs < 1000) return;
 
-            long windowMs    = now - _statsLastPrintMs;
-            long enq         = Interlocked.Exchange(ref _statsWindowEnqueued, 0);
-            long sent        = Interlocked.Exchange(ref _statsWindowSendOk,   0);
-            long drop        = Interlocked.Exchange(ref _statsWindowDrop,     0);
-            int  clients     = _server.ClientCount;
-            long queueLen    = _queue.Count;
-            long msSinceOk   = now - _lastSendOkMs;
+            long windowMs = now - _statsLastPrintMs;
+            long enq      = Interlocked.Exchange(ref _statsWindowEnqueued, 0);
+            long sent     = Interlocked.Exchange(ref _statsWindowSendOk,   0);
+            long drop     = Interlocked.Exchange(ref _statsWindowDrop,     0);
+#if UNITY_EDITOR
+            int  clients  = _clientCount?.Invoke() ?? 0;
+#else
+            int  clients  = 0;
+#endif
+            long queueLen   = _queue.Count;
+            long msSinceOk  = now - _lastSendOkMs;
 
             _statsLastPrintMs = now;
 
-            // enqFps / sentFps approximate (based on window)
             float enqFps  = enq  * 1000f / windowMs;
             float sentFps = sent * 1000f / windowMs;
 
@@ -181,7 +197,6 @@ namespace MobileBridge
                 $"clients={clients} msSinceLastSendOk={msSinceOk} " +
                 $"totalSent={_totalSendOk} totalDrop={_totalDropped} totalErr={_totalSendErr}");
 
-            // Stall detection: clients connected but nothing sent for a while
             if (clients > 0 && msSinceOk > StallThresholdMs)
             {
                 MobileBridge.MBLogWarning(

@@ -19,6 +19,7 @@ namespace MobileBridge.Editor
         // ── State ──────────────────────────────────────────────────────────────
 
         private MobileBridge _bridge;
+        private WebSocketServer _server;
         private bool  _isRunning;
         private int   _clientCount;
         private float _refreshTimer;
@@ -254,10 +255,24 @@ namespace MobileBridge.Editor
         {
             EnsureBridgeComponent();
             if (_bridge == null) return;
-            _bridge.targetFps    = _targetFps;
-            _bridge.jpegQuality  = _jpegQuality;
-            // streamWidth/streamHeight no longer set here;
-            // CaptureLoop uses Screen.width/height (Game View size) directly.
+
+            // ── Create and bind the server ─────────────────────────────────────
+            _server = new WebSocketServer(ClientHtmlPath);
+
+            // Bind all delegate slots on MobileBridge before calling StartBridge()
+            MobileBridge.ClientCountProvider    = () => _server.ClientCount;
+            MobileBridge.BroadcastFrameAction   = jpeg => _server.BroadcastFrame(jpeg);
+            MobileBridge.BroadcastTextAction    = text => _server.BroadcastText(text);
+            MobileBridge.SendTextAction         = (id, text) => _server.SendText(id, text);
+            MobileBridge.StartServerAction      = () => _server.Start();
+            MobileBridge.StopServerAction       = () => { _server.Stop(); _server.Dispose(); _server = null; };
+            MobileBridge.RegisterHelloHandler   = handler => _server.OnHelloReceived   += handler;
+            MobileBridge.RegisterConnectHandler = handler => _server.OnClientConnected += handler;
+            MobileBridge.RegisterTouchHandler   = handler => _server.OnTouchMessage    += handler;
+            MobileBridge.UnregisterTouchHandler = handler => _server.OnTouchMessage    -= handler;
+
+            _bridge.targetFps   = _targetFps;
+            _bridge.jpegQuality = _jpegQuality;
             _bridge.StartBridge();
             _isRunning = true;
         }
@@ -266,6 +281,18 @@ namespace MobileBridge.Editor
         {
             _bridge?.StopBridge();
             _isRunning = false;
+
+            // Clear delegate slots so stale closures don't hold a dead server
+            MobileBridge.ClientCountProvider    = null;
+            MobileBridge.BroadcastFrameAction   = null;
+            MobileBridge.BroadcastTextAction    = null;
+            MobileBridge.SendTextAction         = null;
+            MobileBridge.StartServerAction      = null;
+            MobileBridge.StopServerAction       = null;
+            MobileBridge.RegisterHelloHandler   = null;
+            MobileBridge.RegisterConnectHandler = null;
+            MobileBridge.RegisterTouchHandler   = null;
+            MobileBridge.UnregisterTouchHandler = null;
         }
 
         private void EnsureBridgeComponent()
@@ -278,16 +305,24 @@ namespace MobileBridge.Editor
 
         // ── Helpers ────────────────────────────────────────────────────────────
 
+        private static string ClientHtmlPath
+        {
+            get
+            {
+                string packageRoot = System.IO.Path.GetFullPath(
+                    "Packages/com.dengxuhui.unity-editor-touch-bridge");
+                return System.IO.Path.Combine(packageRoot, "WebClient", "client.html");
+            }
+        }
+
         /// <summary>
         /// Returns the best LAN IP address of this machine.
         /// Priority: private RFC-1918 addresses (192.168/10/172.16-31) found via
-        /// NetworkInterface enumeration, which avoids macOS virtual/test interfaces
-        /// (e.g. 198.18.x.x used by the Proxyman/Charles performance network range).
+        /// NetworkInterface enumeration, which avoids macOS virtual/test interfaces.
         /// Falls back to the UDP-connect trick, then 127.0.0.1.
         /// </summary>
         internal static string GetLocalIP()
         {
-            // 1. Enumerate all up, non-loopback, non-virtual interfaces
             foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
             {
                 if (ni.OperationalStatus != OperationalStatus.Up) continue;
@@ -304,7 +339,6 @@ namespace MobileBridge.Editor
                 }
             }
 
-            // 2. UDP-connect fallback (no packets sent)
             try
             {
                 using var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, 0);
@@ -345,11 +379,8 @@ namespace MobileBridge.Editor
         private static bool IsPrivateLanAddress(IPAddress addr)
         {
             var b = addr.GetAddressBytes();
-            // 10.0.0.0/8
             if (b[0] == 10) return true;
-            // 172.16.0.0/12
             if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;
-            // 192.168.0.0/16
             if (b[0] == 192 && b[1] == 168) return true;
             return false;
         }
