@@ -8,7 +8,8 @@
 
 - **包名**：`com.dengxuhui.unity-editor-touch-bridge`
 - **Unity 最低版本**：2022.3 LTS
-- **强依赖**：URP 14.0+、Input System 1.7.0+（仅支持 URP，Built-in RP / HDRP 无法使用）
+- **强依赖**：URP 14.0+（仅支持 URP，Built-in RP / HDRP 无法使用）
+- **可选依赖**：Input System 1.7.0+。安装后 `MobileBridge.Runtime.asmdef` 的 `versionDefines` 自动定义 `MOBILE_BRIDGE_INPUT_SYSTEM`，启用 New IS 注入路径（`QueueStateEvent` 虚拟 Touchscreen）。未安装时仅 Legacy 路径（`StandaloneInputModule` BaseInput override）生效。
 - **开发用 Unity 工程**：`Sandbox~/`（不随包发布，`~` 后缀使 Unity 跳过导入，`.gitignore` 已屏蔽 Library 等生成目录）
 
 ## 目录职责（不要搞混）
@@ -41,14 +42,17 @@
 2. **Unity 端（C#）**：减去 Game View 黑边偏移，翻转 Y 轴（手机原点左上，Unity 原点左下）
 3. **Windows 额外处理**：`Screen.dpi / 96f` 换算 DPI 缩放，macOS Retina 固定 2x
 
-## 帧捕获架构（三步，不能合并）
+## 帧捕获架构（CaptureLoop 协程，不能改回 AsyncGPUReadback）
 
 ```
-① ScriptableRenderPass.Execute() → AsyncGPUReadback（非阻塞，主线程）
-② onComplete 回调（主线程）→ 复制数据到托管内存，投入后台队列
-③ 后台线程（常驻）→ JPEG 编码 → WebSocket 发送
+① MobileBridge.CaptureLoop 协程（主线程）
+     yield return WaitForEndOfFrame        ← Canvas Overlay 已完整合成
+② ReadPixels（同步，~1-3ms）+ EncodeToJPG（~2-5ms）
+③ FrameCapturer.EnqueueJpeg() → BlockingCollection(capacity:2)
+④ 后台常驻线程 → WebSocket Binary 发送
 ```
-不能在②中直接编码（主线程，JPEG 编码 10-30ms 会卡帧），不能用 `ReadPixels`（阻塞 GPU）。
+
+**必须用 `WaitForEndOfFrame`，禁止换回 `AsyncGPUReadback`**：`ScriptableRenderPass.Execute()` 执行时 Canvas Overlay 尚未合成到 backbuffer，`AsyncGPUReadback` 拿到的帧不含 UI。`URPCaptureFeature` 保留为空壳仅为兼容已配置的 Renderer Asset，不注入任何 RenderPass。
 
 ## URPCaptureFeature 注入条件（三个条件同时满足才注入）
 
@@ -62,10 +66,16 @@ bool isGameView   = renderingData.cameraData.cameraType == CameraType.Game;
 ## 触控数据格式
 
 ```json
-{ "type": "touch", "event": "began|moved|ended|cancelled",
+{ "type": "touch", "eventType": "began|moved|ended|cancelled",
   "touches": [{ "id": 0, "nx": 0.45, "ny": 0.32 }] }
 ```
-`nx`/`ny` 为归一化坐标，通过 `InputSystem.QueueStateEvent` 注入，系统鼠标不动。
+
+`nx`/`ny` 为归一化坐标。`TouchReceiver` 解析后走双路注入：
+
+- **New IS 路径**（`#if MOBILE_BRIDGE_INPUT_SYSTEM`）：`InputSystem.QueueStateEvent(virtualTouchscreen)`，系统鼠标不动
+- **Legacy 路径**（始终编译）：维护跨帧 `_legacyActive` 状态表，经 `LegacyTouchInput`（`BaseInput` override）喂给 `StandaloneInputModule`
+
+`PendingTouch.phase` 统一使用 `UnityEngine.TouchPhase`（无 IS 依赖），IS 路径内部调用 `ToISPhase()` 转换为 `UnityEngine.InputSystem.TouchPhase`。
 
 ## 零侵入原则（硬性约束，不得违反）
 

@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **包名**：`com.dengxuhui.unity-editor-touch-bridge`
 - **Unity 最低版本**：2022.3 LTS
-- **强依赖**：URP 14.0+、Input System 1.7.0+（仅支持 URP）
+- **强依赖**：URP 14.0+（仅支持 URP）
+- **可选依赖**：Input System 1.7.0+。通过 asmdef `versionDefines` 定义 `MOBILE_BRIDGE_INPUT_SYSTEM`，IS API 全部在此符号内守卫
 - **开发用 Unity 工程**：`Sandbox~/`（`~` 后缀使 Unity 不导入，Library 等目录已被 `.gitignore` 屏蔽）
 
 ## 开发工作流
@@ -30,7 +31,7 @@ Runtime 通过 `#if UNITY_EDITOR` 静态委托槽与 Editor 通信：`MobileBrid
 
 | 目录 | 说明 |
 |------|------|
-| `Runtime/Core/` | 主入口 `MobileBridge.cs`（生命周期 + CaptureLoop 协程）、`FrameCapturer.cs`（后台发送队列）、`TouchReceiver.cs`（注入 Input System）、`CoordinateMapper.cs`（坐标换算） |
+| `Runtime/Core/` | 主入口 `MobileBridge.cs`（生命周期 + CaptureLoop 协程）、`FrameCapturer.cs`（后台发送队列）、`TouchReceiver.cs`（双路触控注入）、`LegacyTouchInput.cs`（`BaseInput` override）、`CoordinateMapper.cs`（坐标换算） |
 | `Runtime/Capture/` | `URPCaptureFeature.cs`（空壳，保留兼容性，实际捕获已迁移至 CaptureLoop） |
 | `Editor/Network/` | `WebSocketServer.cs`（websocket-sharp，**Editor only**） |
 | `Editor/` | `MobileBridgeWindow.cs`、`SetupWizard.cs`、`QRCodeGenerator.cs`、`BridgeLogger.cs` |
@@ -59,11 +60,17 @@ CaptureLoop 协程（主线程）
   → getBoundingClientRect() 归一化为 nx/ny [0,1]
   → WebSocket JSON 上行 (ws://host:8765)
   → WebSocketServer.OnTouchMessage（线程池）
-  → TouchReceiver ConcurrentQueue
-  → Tick()（主线程 Update）
+  → TouchReceiver ConcurrentQueue（PendingTouch.phase: UnityEngine.TouchPhase，无 IS 依赖）
+  → Tick()（主线程 Update，[DefaultExecutionOrder(-1000)]）
   → CoordinateMapper（Y 轴翻转 + 黑边偏移 + DPI 换算）
-  → InputSystem.QueueStateEvent(virtualTouchscreen)
+  ├─ [#if MOBILE_BRIDGE_INPUT_SYSTEM]
+  │    ToISPhase() → InputSystem.QueueStateEvent(virtualTouchscreen)
+  └─ 维护 _legacyActive 跨帧状态表（Stationary 持久化）
+       → LegacyTouchInput.SetTouches()
+       → StandaloneInputModule.inputOverride.GetTouch(i)
 ```
+
+`MobileBridge.StartBridge()` 自动检测 `StandaloneInputModule`，找到则挂载 `LegacyTouchInput` 并设为 `inputOverride`（用户无感）；`StopBridge()` 时清理。两条路径独立，可同时运行。
 
 ### 网络端口
 
@@ -85,6 +92,7 @@ CaptureLoop 协程（主线程）
 - `MobileBridge.Runtime.asmdef` 的 `precompiledReferences` 不得包含 `websocket-sharp`
 - 不得在 `Runtime/` 引入任何新的第三方 DLL（除非 Player Build 必需，且需在 commit 中说明）
 - 不得在用户 `Assets/` 目录下创建任何文件；运行时临时文件只能写 `Application.persistentDataPath`
+- `com.unity.inputsystem` **不得**加回 `package.json` 的 `dependencies`；IS 支持通过 `versionDefines` + `#if MOBILE_BRIDGE_INPUT_SYSTEM` 实现可选化，强制安装会给 Legacy-only 用户弹出 backend 配置对话框
 
 ## 关键设计文档
 

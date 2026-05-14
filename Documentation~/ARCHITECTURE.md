@@ -22,7 +22,8 @@ MobileBridge.Editor   (依赖 Runtime + websocket-sharp，仅 Editor)
 |------|------|
 | `MobileBridge.cs` | 主入口。管理生命周期（`StartBridge` / `StopBridge` / `IsActive`）。通过 `#if UNITY_EDITOR` 静态委托槽调用 Editor 网络层。 |
 | `FrameCapturer.cs` | `WaitForEndOfFrame` 协程捕获帧。接受 `Action<byte[]> broadcastFrame` 与 `Func<int> clientCount` 注入，主线程 JPEG 编码后投入后台发送队列。 |
-| `TouchReceiver.cs` | 接受 `subscribe` / `unsubscribe` 委托注入。解析触控 JSON，通过 `InputSystem.QueueStateEvent` 注入虚拟 `Touchscreen`，主线程消费 `ConcurrentQueue`。 |
+| `TouchReceiver.cs` | 接受 `subscribe` / `unsubscribe` 委托注入。解析触控 JSON，主线程消费 `ConcurrentQueue`。**双路注入**：New IS 路径通过 `InputSystem.QueueStateEvent` 注入虚拟 `Touchscreen`（`MOBILE_BRIDGE_INPUT_SYSTEM` 守卫）；Legacy 路径维护跨帧 `_legacyActive` 状态表，暴露 `LegacyTouches` 供 `LegacyTouchInput` 读取。 |
+| `LegacyTouchInput.cs` | 继承 `BaseInput`，由 `MobileBridge` 自动挂载并设为 `StandaloneInputModule.inputOverride`。重写 `touchCount`、`GetTouch(i)` 等方法，将桥接触控喂入 EventSystem，无需 New Input System。 |
 | `CoordinateMapper.cs` | 处理 Game View 黑边偏移、Y 轴翻转、Windows DPI 缩放（`Screen.dpi / 96f`）、macOS Retina（固定 2x）。 |
 
 ### Runtime/Capture
@@ -66,12 +67,18 @@ MobileBridge.Editor   (依赖 Runtime + websocket-sharp，仅 Editor)
         ↓ getBoundingClientRect() 归一化 → JSON
 WebSocket 上行（ws://host:8765）
         ↓ WebSocketServer.OnTouchMessage 事件
-TouchReceiver.OnMessage()（线程池线程）
-        ↓ ConcurrentQueue<TouchData>
-TouchReceiver.Tick()（主线程，Update）
+TouchReceiver.HandleMessage()（线程池线程）
+        ↓ ConcurrentQueue<PendingTouch>（phase 用 UnityEngine.TouchPhase，无 IS 依赖）
+TouchReceiver.Tick()（主线程，Update，[DefaultExecutionOrder(-1000)]）
         ↓ CoordinateMapper 坐标换算
-InputSystem.QueueStateEvent(virtualTouchscreen)
+        ├─[MOBILE_BRIDGE_INPUT_SYSTEM]─→ InputSystem.QueueStateEvent(virtualTouchscreen)
+        │                                  （New IS 路径，InputSystemUIInputModule）
+        └──────────────────────────────→ LegacyTouchInput.SetTouches()
+                                           ↓ StandaloneInputModule.inputOverride
+                                           （Legacy 路径，BaseInput override）
 ```
+
+两条路径并行运行，`MobileBridge.StartBridge()` 时自动检测 `StandaloneInputModule`；若不存在则 Legacy 路径静默跳过。
 
 ## 委托绑定示意
 
@@ -104,3 +111,4 @@ MobileBridge.OnStartServer = null;
 - `websocket-sharp.dll` 的 `.meta` 中 `Include Platforms` 仅含 `Editor`，不会被 Unity 打包进 Player。
 - `MobileBridge.Runtime.asmdef` 的 `precompiledReferences` 不包含 `websocket-sharp`。
 - `Runtime` 代码中所有 Editor-only 字段均受 `#if UNITY_EDITOR` 保护，Player Build 时编译器完全剔除。
+- `com.unity.inputsystem` 为**可选依赖**，不在 `package.json` 的 `dependencies` 中。`MobileBridge.Runtime.asmdef` 通过 `versionDefines` 在包存在时定义 `MOBILE_BRIDGE_INPUT_SYSTEM`，所有 IS API 调用均在此符号守卫内；`Unity.InputSystem` 不再作为显式 `references` 条目（利用其 `autoReferenced: true` 特性自动注入）。

@@ -64,7 +64,8 @@
 |------|------|------|
 | `URPCaptureFeature.cs` | C# | 挂载在 URP Renderer Asset，保留空壳以兼容已配置项目（捕获已迁移至 MobileBridge） |
 | `FrameCapturer.cs` | C# | 后台线程 JPEG 编码 + WebSocket 推流 |
-| `TouchReceiver.cs` | C# | WebSocket 服务端接收触控坐标，注入 Unity Input System |
+| `TouchReceiver.cs` | C# | WebSocket 服务端接收触控坐标，双路注入：New IS（`QueueStateEvent`）和 Legacy（`BaseInput` override via `LegacyTouchInput`） |
+| `LegacyTouchInput.cs` | C# | 继承 `BaseInput`，由 `MobileBridge` 自动挂载为 `StandaloneInputModule.inputOverride` |
 | `CoordinateMapper.cs` | C# | 三坐标系换算，处理 Y 轴翻转和黑边偏移 |
 | `MobileBridgeWindow.cs` | C# (Editor) | Editor 控制面板，显示连接状态、二维码、配置参数 |
 | `client.html` | HTML/JS | 手机端单文件网页，Canvas 渲染 + Touch 采集 |
@@ -112,17 +113,18 @@ unity-editor-touch-bridge/             ← Git 仓库根目录
 
 ```json
 {
-  "name": "com.yourname.unitymobilebridge",
+  "name": "com.dengxuhui.unity-editor-touch-bridge",
   "version": "0.1.0",
-  "displayName": "Unity Mobile Bridge",
+  "displayName": "Unity Editor Touch Bridge",
   "description": "Stream Unity Game View to mobile browser with touch input support",
-  "unity": "2021.3",
+  "unity": "2022.3",
   "dependencies": {
-    "com.unity.inputsystem": "1.7.0",
     "com.unity.render-pipelines.universal": "14.0.0"
   }
 }
 ```
+
+> `com.unity.inputsystem` 为**可选依赖**，不在 `dependencies` 中。安装后通过 asmdef `versionDefines` 自动启用 `MOBILE_BRIDGE_INPUT_SYSTEM` 编译符号，IS API 路径按需激活。
 
 ---
 
@@ -212,7 +214,7 @@ private IEnumerator CaptureLoop()
 
 ---
 
-### 4.3 触控注入：TouchReceiver
+### 4.3 触控注入：TouchReceiver + LegacyTouchInput
 
 **接收格式（JSON）：**
 
@@ -229,28 +231,27 @@ private IEnumerator CaptureLoop()
 
 坐标使用归一化值 `[0,1]`，与手机物理分辨率无关。
 
-**注入 Unity Input System：**
+**双路注入架构：**
 
-```csharp
-void ProcessTouches(TouchData[] touches, TouchPhase phase)
-{
-    foreach (var t in touches)
-    {
-        Vector2 unityPos = CoordinateMapper.NormalizedToUnity(t.nx, t.ny);
+| 路径 | 条件 | 目标 |
+|------|------|------|
+| New Input System | `MOBILE_BRIDGE_INPUT_SYSTEM` 已定义（IS 包已安装） | `InputSystemUIInputModule` |
+| Legacy Input Manager | 始终编译 | `StandaloneInputModule`（通过 `BaseInput` override） |
 
-        var state = new TouchState
-        {
-            touchId  = t.id,
-            phase    = phase,
-            position = unityPos,
-        };
-
-        // 直接进入 Unity Input System 事件队列
-        // 系统鼠标光标完全不动，不影响电脑正常使用
-        InputSystem.QueueStateEvent(_touchDevice, state);
-    }
-}
 ```
+WS 消息 → ConcurrentQueue<PendingTouch>（phase: UnityEngine.TouchPhase，无 IS 依赖）
+        ↓ TouchReceiver.Tick()（主线程）
+        ├─ #if MOBILE_BRIDGE_INPUT_SYSTEM
+        │    ToISPhase() 转换 → InputSystem.QueueStateEvent(virtualTouchscreen)
+        └─ 维护 _legacyActive 状态表（跨帧 Stationary 持久化）
+             ↓ LegacyTouches (IReadOnlyList<Touch>)
+             → LegacyTouchInput.SetTouches()
+             → StandaloneInputModule.inputOverride.GetTouch(i)
+```
+
+**Legacy 路径的跨帧持久化：** 手机客户端不发送 Stationary 事件。`TouchReceiver` 在每帧开头将仍活跃的触控状态置为 `Stationary`，收到新事件时再覆盖，保证 `StandaloneInputModule` 在两次移动事件之间不会认为手指已抬起（否则拖拽/长按全部失效）。
+
+**自动接线：** `MobileBridge.StartBridge()` 调用 `FindObjectOfType<StandaloneInputModule>()`；找到则 `AddComponent<LegacyTouchInput>()` 并设 `inputOverride`；`StopBridge()` 时清理。用户无需任何额外操作。
 
 **支持的手势：**
 
@@ -259,7 +260,9 @@ void ProcessTouches(TouchData[] touches, TouchPhase phase)
 | 单指点击 | TouchPhase.Began + Ended |
 | 单指拖拽 | TouchPhase.Began + Moved + Ended |
 | 多指触控 | 多个 Touch ID 并发注入 |
-| 长按 | Began 持续保持，无 Moved |
+| 长按 | Began + Stationary（合成）持续，直到 Ended |
+
+**已知限制：** Legacy 路径的 `BaseInput` override 仅对 EventSystem 管辖的 UI 事件有效。用户直接调用 `Input.GetTouch()` 的 gameplay 代码无法感知桥接触控（Legacy Input Manager 底层数组只读，无注入接口）。
 
 ---
 
