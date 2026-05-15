@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- 文档更新：`README.md` 新增"项目状态"，明确本项目已停止维护（Maintenance Stopped），定位为研究项目并暂时搁置
+- 文档更新：`README.md` 新增"视频链路架构限制（关键）"，说明 `WebSocket(TCP) + JPEG` 在弱网场景下的架构性冻结风险
+- 文档新增：`Documentation~/REMOTE_CONTROL_PROTOCOL_ANALYSIS.md`，系统对比本项目与云游戏/Chrome/成熟远控方案的协议差异，并给出"彻底解决需架构级重构（WebRTC 等实时媒体链路）"结论
+
 ## [0.1.0] - 2026-05-14
 
 ### Added

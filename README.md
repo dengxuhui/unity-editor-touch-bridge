@@ -2,6 +2,16 @@
 
 一个 Unity UPM 插件，将 Unity Game View 实时串流至手机浏览器，并将手机触控事件直接注入 Unity Input System，用于在不打包的情况下测试移动端触控交互。
 
+## 项目状态
+
+> **本项目已停止维护（Maintenance Stopped）**
+>
+> 作者将本项目定位为研究项目，目前已发现要达到生产级稳定性需要进行架构级重构（核心视频链路需从 `WebSocket + JPEG` 迁移到实时媒体协议体系，如 WebRTC）。
+>
+> 在"必须支持 iOS Safari 且保持纯浏览器方案"的约束下，现有技术路径无法彻底解决卡顿/冻结问题，因此项目暂时搁置，不再继续迭代。
+
+详细分析见：`Documentation~/REMOTE_CONTROL_PROTOCOL_ANALYSIS.md`
+
 ## 核心特性
 
 - **手机端无需安装 App**，用浏览器直接访问即可
@@ -223,6 +233,14 @@ internal static class MobileBridgeInputBridge
 | 推荐场景 | 新项目 / 已用 IS | 源码可改的插件 | 自研且分发的 DLL |
 
 ## 已知限制
+
+### 视频链路架构限制（关键）
+
+当前实现采用 `WebSocket(TCP) + JPEG` 帧推送。该方案在网络抖动时会受 TCP 队头阻塞影响，可能出现延迟累积、卡顿、冻结。
+
+这属于协议与媒体模型不匹配导致的架构级限制，应用层重连/心跳只能缓解，无法根治。若需生产级稳定低时延远控，需要升级为 WebRTC 等实时媒体架构。
+
+详见：`Documentation~/REMOTE_CONTROL_PROTOCOL_ANALYSIS.md`
 
 ### New Input System 路径需要 Game View 聚焦
 
