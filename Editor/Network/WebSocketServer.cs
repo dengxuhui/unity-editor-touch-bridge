@@ -30,10 +30,25 @@ namespace MobileBridge.Editor
         // Session counter — incremented/decremented by WS callbacks (thread-pool threads).
         private int _sessionCount;
 
-        // Broadcast diagnostics
+        // Broadcast diagnostics — cumulative
         private long _totalBroadcasts;
-        private long _totalBroadcastMs;
+        private long _totalBroadcastUs;    // microseconds (replaces ms for sub-ms precision)
         private long _slowBroadcastCount;  // > 300 ms
+        private long _slowBroadcast50ms;   // > 50 ms
+        private long _slowBroadcast5ms;    // > 5 ms
+        private long _slowBroadcast1ms;    // > 1 ms
+
+        // Per-second window (reset each heartbeat tick)
+        private long _windowStartMs;
+        private long _windowTxCount;
+        private long _windowTxSumUs;
+        private long _windowTxMaxUs;   // racy non-atomic update, OK for diagnostics
+        private long _windowTxBytes;
+
+        // Current session tracking (reset on session_open)
+        private long _sessOpenMs;
+        private long _sessTxFrames;
+        private long _sessTxBytes;
 
         // Heartbeat
         private Timer _heartbeatTimer;
@@ -81,9 +96,12 @@ namespace MobileBridge.Editor
             try { _wsServer?.Stop(); }   catch { }
             try { _httpServer?.Stop(); } catch { }
 
-            Debug.Log($"[MB][WebSocketServer] Stopped. totalBroadcasts={_totalBroadcasts} " +
-                      $"avgBroadcastMs={(_totalBroadcasts > 0 ? _totalBroadcastMs / _totalBroadcasts : 0)} " +
-                      $"slowBroadcasts={_slowBroadcastCount}");
+            long avgUs = _totalBroadcasts > 0 ? _totalBroadcastUs / _totalBroadcasts : 0;
+            Debug.Log(
+                $"[MB][WebSocketServer] Stopped. " +
+                $"totalBroadcasts={_totalBroadcasts} avgSendUs={avgUs} " +
+                $"slow>1ms={_slowBroadcast1ms} slow>5ms={_slowBroadcast5ms} " +
+                $"slow>50ms={_slowBroadcast50ms} slow>300ms={_slowBroadcastCount}");
         }
 
         /// <summary>Broadcast a text message to all connected clients.</summary>
@@ -143,16 +161,34 @@ namespace MobileBridge.Editor
             }
             sw.Stop();
 
-            long ms = sw.ElapsedMilliseconds;
-            Interlocked.Increment(ref _totalBroadcasts);
-            Interlocked.Add(ref _totalBroadcastMs, ms);
+            // Microsecond precision: 1 tick = 1/Frequency seconds
+            long elapsedUs = sw.ElapsedTicks * 1_000_000L / System.Diagnostics.Stopwatch.Frequency;
 
-            if (ms > 300)
+            Interlocked.Increment(ref _totalBroadcasts);
+            Interlocked.Add(ref _totalBroadcastUs, elapsedUs);
+            Interlocked.Increment(ref _windowTxCount);
+            Interlocked.Add(ref _windowTxSumUs, elapsedUs);
+            Interlocked.Add(ref _windowTxBytes, jpegBytes.Length);
+            Interlocked.Add(ref _sessTxBytes, jpegBytes.Length);
+            Interlocked.Increment(ref _sessTxFrames);
+
+            // Approximate max (racy non-atomic, acceptable for diagnostics)
+            if (elapsedUs > Volatile.Read(ref _windowTxMaxUs))
+                Volatile.Write(ref _windowTxMaxUs, elapsedUs);
+
+            // Slow-send buckets — strictly nested (only one bucket incremented per call)
+            if      (elapsedUs >= 300_000) { Interlocked.Increment(ref _slowBroadcastCount); }
+            else if (elapsedUs >=  50_000) { Interlocked.Increment(ref _slowBroadcast50ms);  }
+            else if (elapsedUs >=   5_000) { Interlocked.Increment(ref _slowBroadcast5ms);   }
+            else if (elapsedUs >=   1_000) { Interlocked.Increment(ref _slowBroadcast1ms);   }
+
+            // Real-time warning for anything suspicious (> 50 ms = TCP send-buffer pressure)
+            if (elapsedUs >= 50_000)
             {
-                Interlocked.Increment(ref _slowBroadcastCount);
+                double ms = elapsedUs / 1000.0;
                 Debug.LogWarning(
                     $"[MB][WebSocketServer] WARN broadcast_slow — " +
-                    $"{ms}ms for {count} client(s) frameSize={jpegBytes.Length}B");
+                    $"{ms:F1}ms for {count} client(s) frameSize={jpegBytes.Length}B");
             }
         }
 
@@ -163,17 +199,46 @@ namespace MobileBridge.Editor
             Stop();
         }
 
-        /// <summary>Broadcast a lightweight heartbeat text frame every second.</summary>
+        /// <summary>Broadcast a lightweight heartbeat text frame every second and print per-second STATS.</summary>
         private void SendHeartbeat()
         {
             var sessions = _wsServer?.WebSocketServices["/"]?.Sessions;
-            if (sessions == null || sessions.Count == 0) return;
-            try
+            if (sessions != null && sessions.Count > 0)
             {
-                long t = (long)(DateTime.UtcNow - new DateTime(1970,1,1,0,0,0,DateTimeKind.Utc)).TotalMilliseconds;
-                sessions.Broadcast($"{{\"type\":\"hb\",\"t\":{t}}}");
+                try
+                {
+                    long t = (long)(DateTime.UtcNow - new DateTime(1970,1,1,0,0,0,DateTimeKind.Utc)).TotalMilliseconds;
+                    sessions.Broadcast($"{{\"type\":\"hb\",\"t\":{t}}}");
+                }
+                catch { }
             }
-            catch { }
+
+            // ── Per-second STATS ─────────────────────────────────────────────
+            long nowMs = (long)Environment.TickCount;
+            if (_windowStartMs == 0) { _windowStartMs = nowMs; return; }
+
+            long windowMs = nowMs - _windowStartMs;
+            if (windowMs < 900) return;   // guard against timer jitter
+            _windowStartMs = nowMs;
+
+            long cnt     = Interlocked.Exchange(ref _windowTxCount,  0);
+            long sumUs   = Interlocked.Exchange(ref _windowTxSumUs,  0);
+            long maxUs   = Interlocked.Exchange(ref _windowTxMaxUs,  0);
+            long txBytes = Interlocked.Exchange(ref _windowTxBytes,  0);
+
+            float txFps   = windowMs > 0 ? cnt   * 1000f / windowMs : 0;
+            float txKBs   = windowMs > 0 ? txBytes * 1000f / 1024f / windowMs : 0;
+            float avgUs   = cnt > 0 ? sumUs / (float)cnt : 0;
+            float maxMs   = maxUs / 1000f;
+            int   clients = ClientCount;
+
+            Debug.Log(
+                $"[MB][WebSocketServer] STATS " +
+                $"txFps={txFps:F1} txKBs={txKBs:F0} " +
+                $"avgSendUs={avgUs:F0} maxSendMs={maxMs:F2} " +
+                $"slow>1ms={_slowBroadcast1ms} slow>5ms={_slowBroadcast5ms} " +
+                $"slow>50ms={_slowBroadcast50ms} slow>300ms={_slowBroadcastCount} " +
+                $"clients={clients}");
         }
 
         // ── HTTP request handler ───────────────────────────────────────────────
@@ -222,11 +287,32 @@ namespace MobileBridge.Editor
         private void OnSessionEvent(string sessionId, string eventName, string detail)
         {
             int count = ClientCount;
-            Debug.Log($"[MB][WebSocketServer] session_{eventName} id={sessionId} clients={count} {detail}");
+
             if (eventName == "open")
+            {
+                _sessOpenMs  = (long)Environment.TickCount;
+                Interlocked.Exchange(ref _sessTxFrames, 0);
+                Interlocked.Exchange(ref _sessTxBytes,  0);
                 OnClientConnected?.Invoke(sessionId);
+            }
+            else if (eventName == "close")
+            {
+                long durMs   = (long)Environment.TickCount - _sessOpenMs;
+                long frames  = Interlocked.Read(ref _sessTxFrames);
+                long txBytes = Interlocked.Read(ref _sessTxBytes);
+                float avgKbps = durMs > 0 ? txBytes * 8f / durMs : 0;   // bytes/ms * 8 = kbps
+                Debug.Log(
+                    $"[MB][WebSocketServer] session_summary " +
+                    $"id={sessionId} duration={durMs}ms " +
+                    $"txFrames={frames} txMB={txBytes / 1048576f:F2} " +
+                    $"avgKbps={avgKbps:F0} {detail}");
+            }
             else if (eventName == "hello")
+            {
                 OnHelloReceived?.Invoke(sessionId);
+            }
+
+            Debug.Log($"[MB][WebSocketServer] session_{eventName} id={sessionId} clients={count} {detail}");
         }
 
         // ── WebSocket behaviour ────────────────────────────────────────────────

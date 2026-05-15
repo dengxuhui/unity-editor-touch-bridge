@@ -76,8 +76,8 @@
         let frameStallLogged = false;
 
         // Thresholds
-        const STALL_WARN_MS    = 1500;  // warn in status bar
-        const STALL_RECONN_MS  = 3000;  // force ws.close() → auto-reconnect
+        const STALL_WARN_MS    = 3000;  // warn in status bar
+        const STALL_RECONN_MS  = 8000;  // force ws.close() → auto-reconnect
 
         function updateStatus(connected) {
             if (!showDebug) { statusEl.style.display = 'none'; return; }
@@ -120,12 +120,15 @@
                     frameStallLogged = false;
                 }
 
-                // Force reconnect — ws is alive (heartbeat recent) but video frames stopped
+                // Force reconnect — but only when heartbeat is also stale, meaning the
+                // WebSocket connection itself is dead (not just a transient WiFi hiccup).
+                // Heartbeat arrives every 1 s; if it's fresh the link is alive and will recover.
                 if (ageMs > STALL_RECONN_MS) {
                     const hbAge = lastHbTs > 0 ? now - lastHbTs : -1;
-                    console.warn(`[MB][client] stall_reconnect ageMs=${ageMs} hbAge=${hbAge} totalRx=${totalRxFrames}`);
-                    // Close triggers onclose → automatic reconnect
-                    ws.close(4001, 'stall_reconnect');
+                    if (hbAge < 0 || hbAge > 3000) {
+                        console.warn(`[MB][client] stall_reconnect ageMs=${ageMs} hbAge=${hbAge} totalRx=${totalRxFrames}`);
+                        ws.close(4001, 'stall_reconnect');
+                    }
                 }
             }
         }, 1000);
@@ -184,7 +187,7 @@
             ws.onclose = (e) => {
                 console.warn(`[MB][client] ws_close code=${e.code} reason="${e.reason}" wasClean=${e.wasClean} totalRx=${totalRxFrames}`);
                 updateStatus(false);
-                reconnectTimer = setTimeout(() => openWs(host), 2000);
+                reconnectTimer = setTimeout(() => openWs(host), 500);
             };
 
             ws.onerror = () => {

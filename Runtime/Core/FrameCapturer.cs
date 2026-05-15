@@ -48,6 +48,8 @@ namespace MobileBridge
         private long _statsWindowEnqueued;
         private long _statsWindowSendOk;
         private long _statsWindowDrop;
+        private long _statsWindowTxBytes;   // bytes successfully broadcast this window
+        private long _statsWindowMaxSendUs; // max broadcast time this window (racy, OK for diagnostics)
         private long _statsLastPrintMs;
 
         // Stall detection: if clients are connected and nothing is sent for this long, warn.
@@ -138,10 +140,14 @@ namespace MobileBridge
                     _broadcastFrame?.Invoke(jpeg);
                     sw.Stop();
 
-                    long elapsedMs = sw.ElapsedMilliseconds;
+                    long elapsedUs = sw.ElapsedTicks * 1_000_000L / System.Diagnostics.Stopwatch.Frequency;
+                    long elapsedMs = elapsedUs / 1000;
                     _lastSendOkMs = (long)Environment.TickCount;
                     Interlocked.Increment(ref _totalSendOk);
                     Interlocked.Increment(ref _statsWindowSendOk);
+                    Interlocked.Add(ref _statsWindowTxBytes, jpeg.Length);
+                    if (elapsedUs > Volatile.Read(ref _statsWindowMaxSendUs))
+                        Volatile.Write(ref _statsWindowMaxSendUs, elapsedUs);
 
                     if (elapsedMs > 300)
                     {
@@ -174,9 +180,11 @@ namespace MobileBridge
             if (now - _statsLastPrintMs < 1000) return;
 
             long windowMs = now - _statsLastPrintMs;
-            long enq      = Interlocked.Exchange(ref _statsWindowEnqueued, 0);
-            long sent     = Interlocked.Exchange(ref _statsWindowSendOk,   0);
-            long drop     = Interlocked.Exchange(ref _statsWindowDrop,     0);
+            long enq      = Interlocked.Exchange(ref _statsWindowEnqueued,    0);
+            long sent     = Interlocked.Exchange(ref _statsWindowSendOk,      0);
+            long drop     = Interlocked.Exchange(ref _statsWindowDrop,        0);
+            long txBytes  = Interlocked.Exchange(ref _statsWindowTxBytes,     0);
+            long maxUs    = Interlocked.Exchange(ref _statsWindowMaxSendUs,   0);
 #if UNITY_EDITOR
             int  clients  = _clientCount?.Invoke() ?? 0;
 #else
@@ -187,12 +195,14 @@ namespace MobileBridge
 
             _statsLastPrintMs = now;
 
-            float enqFps  = enq  * 1000f / windowMs;
-            float sentFps = sent * 1000f / windowMs;
+            float enqFps    = enq  * 1000f / windowMs;
+            float sentFps   = sent * 1000f / windowMs;
+            float txKBs     = windowMs > 0 ? txBytes * 1000f / 1024f / windowMs : 0;
+            float maxSendMs = maxUs / 1000f;
 
             MobileBridge.MBLog(
                 $"[MB][FrameCapturer] STATS " +
-                $"enqFps={enqFps:F1} sentFps={sentFps:F1} " +
+                $"enqFps={enqFps:F1} sentFps={sentFps:F1} txKBs={txKBs:F0} maxSendMs={maxSendMs:F2} " +
                 $"drop1s={drop} queueLen={queueLen} " +
                 $"clients={clients} msSinceLastSendOk={msSinceOk} " +
                 $"totalSent={_totalSendOk} totalDrop={_totalDropped} totalErr={_totalSendErr}");

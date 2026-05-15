@@ -158,15 +158,25 @@ namespace MobileBridge
         [Range(1, 60)]  public int   targetFps    = 30;
         [Range(1, 100)] public int   jpegQuality  = 75;
 
+        [Header("Capture Quality")]
+        [Tooltip("Linear scale applied before JPEG encoding.\n" +
+                 "1.0 = full resolution (sharp, high bandwidth).\n" +
+                 "0.5 = half linear = 1/4 pixels = ~1/4 bandwidth.\n" +
+                 "Typical tuning: captureScale=1.0 targetFps=20 (≈9 Mbps) or\n" +
+                 "captureScale=0.5 targetFps=20 (≈2.3 Mbps, WiFi-safe).")]
+        [Range(0.1f, 1.0f)] public float captureScale = 1.0f;
+
         // ── Internal references ────────────────────────────────────────────────
 
         private FrameCapturer  _capturer;
         private TouchReceiver  _receiver;
         private LegacyTouchInput _legacyInput;
 
-        // Reusable texture for ReadPixels
-        private Texture2D _readbackTex;
-        private float     _lastCaptureTime;
+        // Reusable textures for ReadPixels + optional downscale
+        private Texture2D     _readbackTex;   // full-res screen capture
+        private RenderTexture _scaledRt;      // downscale target (null when captureScale >= 1)
+        private Texture2D     _scaledTex;     // readback from _scaledRt
+        private float         _lastCaptureTime;
 
         // ── Capture diagnostics ────────────────────────────────────────────────
         private int   _captureCountThisSecond;
@@ -175,10 +185,14 @@ namespace MobileBridge
         private float _lastStatsTime;
         private long  _totalCaptureBytes;
         private int   _totalCaptureFrames;
+        private long  _captureBytesThisSecond;  // resets each stats window
+        private int   _lastEncodeW;             // encoded frame width (may differ from screen when captureScale < 1)
+        private int   _lastEncodeH;
 
         // Stall detection: clients connected but nothing enqueued
         private const float CaptureStallThresholdSec = 2f;
         private float _lastEnqueueTime = -1f;
+        private int   _prevClientCount;
 
         private static string ClientHtmlPath
         {
@@ -211,11 +225,9 @@ namespace MobileBridge
         {
             StopBridge();
             if (Instance == this) Instance = null;
-            if (_readbackTex != null)
-            {
-                Destroy(_readbackTex);
-                _readbackTex = null;
-            }
+            if (_readbackTex != null) { Destroy(_readbackTex); _readbackTex = null; }
+            if (_scaledRt   != null) { _scaledRt.Release();   _scaledRt   = null; }
+            if (_scaledTex  != null) { Destroy(_scaledTex);   _scaledTex  = null; }
         }
 
         // ── Bridge control ─────────────────────────────────────────────────────
@@ -251,19 +263,14 @@ namespace MobileBridge
             StartServerAction?.Invoke();
 
             // Subscribe to session events before any client can connect
+            // Send cfg when the client identifies itself with a hello message.
+            // (RegisterConnectHandler fires during OnOpen before the session is registered,
+            // causing websocket-sharp to throw and log a spurious warning — avoid it.)
             RegisterHelloHandler?.Invoke(sessionId =>
             {
                 bool show = ClientDebugOverlayProvider?.Invoke() ?? false;
                 string cfg = $"{{\"type\":\"cfg\",\"showDebug\":{(show ? "true" : "false")}}}";
                 MBLog($"[MB][MobileBridge] hello_recv id={sessionId} → sending cfg showDebug={show}");
-                SendTextAction?.Invoke(sessionId, cfg);
-            });
-
-            RegisterConnectHandler?.Invoke(sessionId =>
-            {
-                bool show = ClientDebugOverlayProvider?.Invoke() ?? false;
-                string cfg = $"{{\"type\":\"cfg\",\"showDebug\":{(show ? "true" : "false")}}}";
-                MBLog($"[MB][MobileBridge] client_connected id={sessionId} → sending cfg showDebug={show}");
                 SendTextAction?.Invoke(sessionId, cfg);
             });
 
@@ -282,9 +289,10 @@ namespace MobileBridge
             IsActive = true;
             _lastStatsTime   = Time.realtimeSinceStartup;
             _lastEnqueueTime = Time.realtimeSinceStartup;
+            _prevClientCount = 0;
             StartCoroutine(CaptureLoop());
 
-            MBLog($"[MB][MobileBridge] Started — targetFps={targetFps} jpegQuality={jpegQuality}");
+            MBLog($"[MB][MobileBridge] Started — targetFps={targetFps} jpegQuality={jpegQuality} captureScale={captureScale:F2}");
         }
 
         public void StopBridge()
@@ -399,6 +407,7 @@ namespace MobileBridge
 
                 if (clients == 0)
                 {
+                    _prevClientCount = 0;
                     _captureSkipNoClientThisSecond++;
                     PrintStatsIfDue();
                     yield return null;
@@ -406,6 +415,13 @@ namespace MobileBridge
                 }
 
                 float now = Time.realtimeSinceStartup;
+
+                // Reset stall timer on 0→1 client transition to avoid a false warning
+                // caused by _lastEnqueueTime being stale during the no-client period.
+                if (_prevClientCount == 0)
+                    _lastEnqueueTime = now;
+                _prevClientCount = clients;
+
                 if (now - _lastCaptureTime < interval)
                 {
                     _captureSkipThrottleThisSecond++;
@@ -434,30 +450,68 @@ namespace MobileBridge
                 int screenW = Screen.width;
                 int screenH = Screen.height;
 
-                if (_readbackTex == null ||
-                    _readbackTex.width  != screenW ||
-                    _readbackTex.height != screenH)
+                byte[] jpeg;
+                if (captureScale < 0.999f)
                 {
-                    if (_readbackTex != null)
+                    // Scaled path: GPU blit from screen backbuffer directly to small RT.
+                    // This avoids a full-res ReadPixels (8+ MB GPU→CPU) and a CPU→GPU re-upload.
+                    // After WaitForEndOfFrame, RenderTexture.active is null (= screen backbuffer);
+                    // Graphics.Blit(null, dest) blits from it with hardware downscaling.
+                    int captureW = Mathf.Max(4, Mathf.RoundToInt(screenW * captureScale));
+                    int captureH = Mathf.Max(4, Mathf.RoundToInt(screenH * captureScale));
+
+                    if (_scaledRt == null || _scaledRt.width != captureW || _scaledRt.height != captureH)
                     {
-                        MBLog($"[MB][MobileBridge] Texture resized {_readbackTex.width}x{_readbackTex.height} → {screenW}x{screenH}");
-                        Destroy(_readbackTex);
+                        if (_scaledRt != null) _scaledRt.Release();
+                        _scaledRt = new RenderTexture(captureW, captureH, 0, RenderTextureFormat.ARGB32);
+                        MBLog($"[MB][MobileBridge] Scaled RT created {captureW}x{captureH} (scale={captureScale:F2})");
                     }
-                    _readbackTex = new Texture2D(screenW, screenH, TextureFormat.RGB24, false);
-                    MBLog($"[MB][MobileBridge] Readback texture created {screenW}x{screenH}");
+                    if (_scaledTex == null || _scaledTex.width != captureW || _scaledTex.height != captureH)
+                    {
+                        if (_scaledTex != null) Destroy(_scaledTex);
+                        _scaledTex = new Texture2D(captureW, captureH, TextureFormat.RGB24, false);
+                    }
+
+                    var prevRt = RenderTexture.active;
+                    Graphics.Blit(null, _scaledRt);   // screen → small RT (GPU-only)
+                    RenderTexture.active = _scaledRt;
+                    _scaledTex.ReadPixels(new Rect(0, 0, captureW, captureH), 0, 0, false);
+                    _scaledTex.Apply(false);
+                    RenderTexture.active = prevRt;
+
+                    jpeg = _scaledTex.EncodeToJPG(jpegQuality);
+                    _lastEncodeW = captureW;
+                    _lastEncodeH = captureH;
                 }
-
-                _readbackTex.ReadPixels(new Rect(0, 0, screenW, screenH), 0, 0, false);
-                _readbackTex.Apply(false);
-
-                byte[] jpeg = _readbackTex.EncodeToJPG(jpegQuality);
+                else
+                {
+                    // Full-res path: ReadPixels from screen backbuffer.
+                    if (_readbackTex == null ||
+                        _readbackTex.width  != screenW ||
+                        _readbackTex.height != screenH)
+                    {
+                        if (_readbackTex != null)
+                        {
+                            MBLog($"[MB][MobileBridge] Readback texture resized {_readbackTex.width}x{_readbackTex.height} → {screenW}x{screenH}");
+                            Destroy(_readbackTex);
+                        }
+                        _readbackTex = new Texture2D(screenW, screenH, TextureFormat.RGB24, false);
+                        MBLog($"[MB][MobileBridge] Readback texture created {screenW}x{screenH}");
+                    }
+                    _readbackTex.ReadPixels(new Rect(0, 0, screenW, screenH), 0, 0, false);
+                    _readbackTex.Apply(false);
+                    jpeg = _readbackTex.EncodeToJPG(jpegQuality);
+                    _lastEncodeW = screenW;
+                    _lastEncodeH = screenH;
+                }
 
                 _capturer?.EnqueueJpeg(jpeg);
                 _lastEnqueueTime = Time.realtimeSinceStartup;
 
                 _captureCountThisSecond++;
                 _totalCaptureFrames++;
-                _totalCaptureBytes += jpeg.Length;
+                _totalCaptureBytes        += jpeg.Length;
+                _captureBytesThisSecond   += jpeg.Length;
 
                 PrintStatsIfDue();
             }
@@ -473,10 +527,13 @@ namespace MobileBridge
             int   clients   = ClientCount;
             long  avgBytes  = _totalCaptureFrames > 0
                 ? _totalCaptureBytes / _totalCaptureFrames : 0;
+            // kbps = bytes/sec * 8 / 1000
+            float txKbps    = windowSec > 0 ? _captureBytesThisSecond * 8f / 1000f / windowSec : 0;
 
             MBLog(
                 $"[MB][MobileBridge] STATS " +
                 $"capFps={capFps:F1} clients={clients} " +
+                $"encodeRes={_lastEncodeW}x{_lastEncodeH} txKbps={txKbps:F0} " +
                 $"skipNoClient={_captureSkipNoClientThisSecond} " +
                 $"skipThrottle={_captureSkipThrottleThisSecond} " +
                 $"avgJpegBytes={avgBytes} " +
@@ -485,6 +542,7 @@ namespace MobileBridge
             _captureCountThisSecond            = 0;
             _captureSkipNoClientThisSecond     = 0;
             _captureSkipThrottleThisSecond     = 0;
+            _captureBytesThisSecond            = 0;
             _lastStatsTime = now;
         }
 
