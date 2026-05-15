@@ -78,6 +78,150 @@ Unity Editor (Game View)
                                      Unity TouchReceiver → Input System
 ```
 
+## 第三方输入插件兼容
+
+插件如何感知桥接触点，取决于它读取输入的方式。下表列出三种场景及对应做法：
+
+| 插件读取方式 | 是否自动兼容 | 需要做什么 |
+|---|---|---|
+| `InputSystemUIInputModule`（New IS） | ✅ 自动 | 无 |
+| `StandaloneInputModule`（EventSystem UI） | ✅ 自动 | 无 |
+| `UnityEngine.Input.GetTouch()` / `touchCount` | ❌ 不自动 | 见下方方案 |
+| `UnityEngine.Input.GetMouseButton(0)` | ❌ 不自动 | 见下方方案 |
+
+> **为什么直接读 `UnityEngine.Input` 不行？**  
+> `UnityEngine.Input` 是 Unity 对原生输入系统的只读 C# 绑定，托管代码无法向其注入合成数据。若安装了 Input System 并启用 **Both** 后端，虚拟 Touchscreen 事件会经兼容层写入 `Input.touchCount` / `Input.GetTouch()`，此时无需任何胶水代码。
+
+---
+
+### 方案 A：Input System（推荐，无胶水代码）
+
+要求：
+- 安装 `com.unity.inputsystem` >= 1.7.0  
+- Project Settings → Player → **Active Input Handling = "Both"**
+
+效果：本插件的 `MOBILE_BRIDGE_INPUT_SYSTEM` 路径自动激活，桥接触点经 IS 虚拟 Touchscreen → 兼容层 → `Input.touchCount` / `Input.GetTouch()` / `Input.GetMouseButton(0)`（需 `Input.simulateMouseWithTouches = true`，Unity 默认开启），所有第三方插件无感知。
+
+---
+
+### 方案 B：委托注入（不安装 Input System 时）
+
+本插件在 `StartBridge()` 时向四个公开静态委托槽写入桥接数据，`StopBridge()` 时置 null：
+
+```csharp
+// MobileBridge.MobileBridge 上的静态字段（StartBridge 后非 null）
+public static System.Func<int>          TouchCountOverride;    // 当前帧触点数
+public static System.Func<int, Touch>   GetTouchOverride;      // 按索引取触点
+public static System.Func<bool>         MouseButton0Override;  // 主触点是否按下
+public static System.Func<Vector2>      MousePositionOverride; // 主触点屏幕坐标
+```
+
+**插件源码可改时（直接引用）**
+
+在读取 `UnityEngine.Input` 的地方替换为委托优先调用：
+
+```csharp
+// 替换前
+int count = Input.GetMouseButton(0) ? 1 : 0;
+Vector2 pos = Input.mousePosition;
+
+// 替换后（桥接启动时用委托，否则回落真实 Input）
+int count = (MobileBridge.MobileBridge.TouchCountOverride?.Invoke()
+             ?? (Input.GetMouseButton(0) ? 1 : 0));
+Vector2 pos = (MobileBridge.MobileBridge.MousePositionOverride?.Invoke()
+               ?? (Vector2)Input.mousePosition);
+```
+
+同时在 `TouchGame.asmdef`（或所在程序集的 `.asmdef`）的 `references` 中加入 `MobileBridge.Runtime` 的 GUID：
+
+```json
+"references": [
+    "GUID:7dbcfb4f3ff984e509d551aa90698342",
+    ...
+]
+```
+
+> GUID 可在 `Library/PackageCache/com.dengxuhui.unity-editor-touch-bridge@xxx/Runtime/MobileBridge.Runtime.asmdef.meta` 中找到。
+
+---
+
+**插件以 DLL 发布、不能修改且不能引用 MobileBridge 时（反射调用）**
+
+通过反射在运行时可选地读取委托，对 DLL 零编译依赖：
+
+```csharp
+using System;
+using System.Reflection;
+using UnityEngine;
+
+/// <summary>
+/// 放入 DLL 内部的帮助类，无需引用 MobileBridge 包。
+/// </summary>
+internal static class MobileBridgeInputBridge
+{
+    static bool _searched;
+    static FieldInfo _touchCount;
+    static FieldInfo _getTouch;
+    static FieldInfo _mouseBtn0;
+    static FieldInfo _mousePos;
+
+    static void Search()
+    {
+        if (_searched) return;
+        _searched = true;
+        var type = Type.GetType("MobileBridge.MobileBridge, MobileBridge.Runtime");
+        if (type == null) return;
+        const BindingFlags F = BindingFlags.Public | BindingFlags.Static;
+        _touchCount = type.GetField("TouchCountOverride",    F);
+        _getTouch   = type.GetField("GetTouchOverride",      F);
+        _mouseBtn0  = type.GetField("MouseButton0Override",  F);
+        _mousePos   = type.GetField("MousePositionOverride", F);
+    }
+
+    public static int GetTouchCount()
+    {
+        Search();
+        var fn = _touchCount?.GetValue(null) as Func<int>;
+        return fn != null ? fn() : (Input.GetMouseButton(0) ? 1 : 0);
+    }
+
+    public static Touch GetTouch(int index)
+    {
+        Search();
+        var fn = _getTouch?.GetValue(null) as Func<int, Touch>;
+        return fn != null ? fn(index) : default;
+    }
+
+    public static bool GetMouseButton0()
+    {
+        Search();
+        var fn = _mouseBtn0?.GetValue(null) as Func<bool>;
+        return fn != null ? fn() : Input.GetMouseButton(0);
+    }
+
+    public static Vector2 GetMousePosition()
+    {
+        Search();
+        var fn = _mousePos?.GetValue(null) as Func<Vector2>;
+        return fn != null ? fn() : (Vector2)Input.mousePosition;
+    }
+}
+```
+
+然后在 DLL 内部把所有 `Input.GetMouseButton(0)`、`Input.GetTouch(i)` 替换为帮助类调用即可。MobileBridge 未安装时自动回落真实 Input，行为无变化。
+
+---
+
+### 各方案对比
+
+| | 方案 A（Input System） | 方案 B 直接引用 | 方案 B 反射 |
+|---|---|---|---|
+| 需要 Input System | ✅ 是 | ❌ 否 | ❌ 否 |
+| 需要修改插件源码 | ❌ 否 | ✅ 是 | ✅ 是（DLL 内部） |
+| 需要引用 MobileBridge | ❌ 否 | ✅ 是 | ❌ 否 |
+| 对已有代码影响 | 需测试 IS 兼容性 | 最小 | 最小 |
+| 推荐场景 | 新项目 / 已用 IS | 源码可改的插件 | 自研且分发的 DLL |
+
 ## 已知限制
 
 ### New Input System 路径需要 Game View 聚焦
@@ -104,7 +248,7 @@ A: 确保 Game View 没有自定义分辨率黑边缩放以外的变换。Window
 A: 本插件使用 `ws://`（明文 WebSocket），iOS 16+ 在某些场景下 Safari 会拦截明文连接。请确认使用局域网 IP 而非 `localhost`，并检查 Safari 的「不安全内容」设置。
 
 **Q: 项目使用 StandaloneInputModule，触控能正常工作吗？**
-A: 可以。`StartBridge()` 时插件自动检测场景中的 `StandaloneInputModule`，将 `LegacyTouchInput`（继承 `BaseInput`）设为其 `inputOverride`，UI 点击、拖拽、滚动均正常。注意：直接调用 `Input.GetTouch()` 的 gameplay 代码无法感知桥接的触控（这是 Legacy Input Manager 的底层限制，与本插件无关）。
+A: 可以。`StartBridge()` 时插件自动检测场景中的 `StandaloneInputModule`，将 `LegacyTouchInput`（继承 `BaseInput`）设为其 `inputOverride`，UI 点击、拖拽、滚动均正常。注意：直接调用 `Input.GetTouch()` / `Input.GetMouseButton(0)` 的 gameplay 代码默认无法感知桥接触控，需按「第三方输入插件兼容」章节的方案 A 或 B 接入。
 
 **Q: 引入包后弹出"enable new input backends"对话框怎么办？**
 A: 此对话框不会再出现。Input System 已改为可选依赖，不再强制安装。如果仍出现此提示，说明你的项目此前已单独安装了 Input System 包但尚未配置 backend，与本插件无关。

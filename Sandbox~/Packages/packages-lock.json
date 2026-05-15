@@ -5,7 +5,6 @@
       "depth": 0,
       "source": "local",
       "dependencies": {
-        "com.unity.inputsystem": "1.7.0",
         "com.unity.render-pipelines.universal": "14.0.0"
       }
     },
@@ -56,15 +55,6 @@
       "depth": 0,
       "source": "registry",
       "dependencies": {},
-      "url": "https://packages.unity.cn"
-    },
-    "com.unity.inputsystem": {
-      "version": "1.14.0",
-      "depth": 1,
-      "source": "registry",
-      "dependencies": {
-        "com.unity.modules.uielements": "1.0.0"
-      },
       "url": "https://packages.unity.cn"
     },
     "com.unity.mathematics": {

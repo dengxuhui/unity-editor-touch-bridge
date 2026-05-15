@@ -102,6 +102,43 @@ namespace MobileBridge
         }
         private static readonly Touch[] _emptyTouches = System.Array.Empty<Touch>();
 
+        // ── Input override delegates ───────────────────────────────────────────
+        // Set on StartBridge(), cleared on StopBridge().
+        // Third-party plugins that read UnityEngine.Input directly can consume
+        // these via reflection — no compile-time reference to this package needed.
+        //
+        // Reflection lookup (cache FieldInfo, re-read value each frame):
+        //   Type   = Type.GetType("MobileBridge.MobileBridge, MobileBridge.Runtime")
+        //   Fields = TouchCountOverride | GetTouchOverride | MouseButton0Override | MousePositionOverride
+        //
+        // See README.md → "第三方输入插件兼容" for full code samples.
+
+        /// <summary>
+        /// Returns the number of active bridged touches this frame.
+        /// Null when the bridge is not running.
+        /// </summary>
+        public static System.Func<int> TouchCountOverride;
+
+        /// <summary>
+        /// Returns the bridged touch at index i (0-based).
+        /// Null when the bridge is not running.
+        /// </summary>
+        public static System.Func<int, Touch> GetTouchOverride;
+
+        /// <summary>
+        /// Returns true while the primary bridged touch is held (non-ended, non-cancelled).
+        /// Mirrors the semantics of Input.GetMouseButton(0).
+        /// Null when the bridge is not running.
+        /// </summary>
+        public static System.Func<bool> MouseButton0Override;
+
+        /// <summary>
+        /// Returns the screen-space position of the primary bridged touch,
+        /// or the real mouse position when no touch is active.
+        /// Null when the bridge is not running.
+        /// </summary>
+        public static System.Func<Vector2> MousePositionOverride;
+
         /// <summary>Number of currently connected WebSocket clients.</summary>
         public int ClientCount
         {
@@ -240,6 +277,7 @@ namespace MobileBridge
             _capturer.Start();
             _receiver.Start();
             WireUpLegacyInput();
+            WireUpInputOverrides();
 
             IsActive = true;
             _lastStatsTime   = Time.realtimeSinceStartup;
@@ -255,6 +293,7 @@ namespace MobileBridge
             IsActive = false;
 
             TearDownLegacyInput();
+            ClearInputOverrides();
             _receiver?.Stop();
             _capturer?.Stop();
 
@@ -309,6 +348,42 @@ namespace MobileBridge
                 sim.inputOverride = null;
             Destroy(_legacyInput);
             _legacyInput = null;
+        }
+
+        // ── Input override delegate wiring ─────────────────────────────────────
+
+        private void WireUpInputOverrides()
+        {
+            TouchCountOverride = () =>
+            {
+                var t = _receiver?.LegacyTouches;
+                return t != null ? t.Count : 0;
+            };
+            GetTouchOverride = i =>
+            {
+                var t = _receiver?.LegacyTouches;
+                return (t != null && (uint)i < (uint)t.Count) ? t[i] : default;
+            };
+            MouseButton0Override = () =>
+            {
+                var t = _receiver?.LegacyTouches;
+                if (t == null || t.Count == 0) return false;
+                var phase = t[0].phase;
+                return phase != TouchPhase.Ended && phase != TouchPhase.Canceled;
+            };
+            MousePositionOverride = () =>
+            {
+                var t = _receiver?.LegacyTouches;
+                return (t != null && t.Count > 0) ? t[0].position : (Vector2)Input.mousePosition;
+            };
+        }
+
+        private static void ClearInputOverrides()
+        {
+            TouchCountOverride    = null;
+            GetTouchOverride      = null;
+            MouseButton0Override  = null;
+            MousePositionOverride = null;
         }
 
         // ── Frame capture loop ─────────────────────────────────────────────────
